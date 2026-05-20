@@ -1,12 +1,17 @@
 import re
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 
 import anthropic
+import fitz  # pymupdf
+from docx import Document
+from pptx import Presentation
+from openpyxl import load_workbook
 
 from .config import HAIKU_MODEL, MAX_TOKENS
-from .api import call_claude
-from .state import ManifestFile, State
+from .api import call_claude, call_claude_vision
+from .state import ManifestFile, State, append_journal, journal_event
 
 
 def has_complexity_signals(text: str) -> bool:
@@ -30,12 +35,15 @@ def has_complexity_signals(text: str) -> bool:
     return False
 
 
-def _build_front_matter(record: ManifestFile) -> str:
+def _build_front_matter(record: ManifestFile, source_path: Path) -> str:
+    ingest_id = record.id.removeprefix("sha256:")
+    extracted_at = datetime.now(timezone.utc).isoformat()
     return (
         f"---\n"
         f"source: {record.source_path}\n"
         f"category: {record.category}\n"
-        f"size_bytes: {record.size_bytes}\n"
+        f"extracted_at: {extracted_at}\n"
+        f"ingest_id: {ingest_id}\n"
         f"---\n\n"
     )
 
@@ -50,10 +58,51 @@ def extract_text_file(
     state: State,
     dest_root: Path,
 ) -> None:
-    raw_text = source_path.read_text(encoding="utf-8", errors="replace")
-    front_matter = _build_front_matter(record)
+    try:
+        raw_text = source_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        try:
+            raw_text = source_path.read_text(encoding="latin-1")
+        except UnicodeDecodeError:
+            raw_text = source_path.read_text(encoding="utf-8", errors="replace")
 
-    if has_complexity_signals(raw_text):
+    front_matter = _build_front_matter(record, source_path)
+
+    if len(raw_text.encode("utf-8")) > 500_000:
+        lines = raw_text.splitlines()
+        chunks = []
+        current_chunk: list[str] = []
+        current_size = 0
+
+        for line in lines:
+            line_bytes = len((line + "\n").encode("utf-8"))
+            if current_size + line_bytes > 500_000 and current_chunk:
+                chunks.append("\n".join(current_chunk))
+                current_chunk = [line]
+                current_size = line_bytes
+            else:
+                current_chunk.append(line)
+                current_size += line_bytes
+
+        if current_chunk:
+            chunks.append("\n".join(current_chunk))
+
+        processed_parts = []
+        for chunk in chunks:
+            user_content = f"Source: {record.source_path}\n\nContent:\n{chunk}"
+            processed_parts.append(call_claude(
+                client,
+                HAIKU_MODEL,
+                prompts["extract_text"],
+                user_content,
+                MAX_TOKENS["extract"],
+                rpm,
+                state,
+                dest_root,
+            ))
+
+        content = "\n\n".join(processed_parts)
+    elif has_complexity_signals(raw_text):
         user_content = f"Source: {record.source_path}\n\nContent:\n{raw_text}"
         content = call_claude(
             client,
@@ -72,6 +121,125 @@ def extract_text_file(
     dest_path.write_text(front_matter + content, encoding="utf-8")
 
 
+def _extract_pdf(source_path: Path) -> str:
+    """Extract text from PDF using pymupdf with header/footer stripping."""
+    doc = fitz.open(source_path)
+
+    # Collect all lines per page to detect headers/footers
+    page_lines: list[list[str]] = []
+    for page in doc:
+        text = page.get_text("text")
+        lines = [line.strip() for line in text.splitlines()]
+        page_lines.append(lines)
+
+    # Identify repeated lines (headers/footers) appearing in >=80% of pages
+    # Only applies when there are 2+ pages (need repetition to detect headers/footers)
+    total_pages = len(page_lines)
+    lines_to_strip: set[str] = set()
+
+    if total_pages >= 2:
+        threshold = total_pages * 0.8  # Use float comparison, not int
+
+        # Count non-empty line occurrences across all pages
+        line_counts: dict[str, int] = {}
+        for lines in page_lines:
+            seen_in_page = set()
+            for line in lines:
+                if line and line not in seen_in_page:
+                    seen_in_page.add(line)
+                    line_counts[line] = line_counts.get(line, 0) + 1
+
+        # Identify lines to strip (appear on >=80% of pages)
+        lines_to_strip = {line for line, count in line_counts.items() if count >= threshold}
+
+    # Extract text with stripping
+    all_text = []
+    for lines in page_lines:
+        filtered_lines = [line for line in lines if line and line not in lines_to_strip]
+        all_text.append("\n".join(filtered_lines))
+
+    doc.close()
+    return "\n\n".join(all_text)
+
+
+def _extract_docx(source_path: Path) -> str:
+    """Extract text from DOCX using python-docx, excluding headers/footers."""
+    doc = Document(source_path)
+    paragraphs = [para.text for para in doc.paragraphs if para.text.strip()]
+    return "\n\n".join(paragraphs)
+
+
+def _extract_pptx(source_path: Path, dest_root: Path, state: State) -> str:
+    """Extract text from PPTX using python-pptx, including speaker notes."""
+    prs = Presentation(source_path)
+    slides_text = []
+
+    for slide_num, slide in enumerate(prs.slides, start=1):
+        # Extract text from shapes
+        slide_text_parts = []
+        for shape in slide.shapes:
+            if hasattr(shape, "text_frame") and shape.text_frame:
+                text = shape.text.strip()
+                if text:
+                    slide_text_parts.append(text)
+
+        # Extract speaker notes
+        notes_text = ""
+        if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+            notes_text = slide.notes_slide.notes_text_frame.text.strip()
+
+        # If slide has no text at all, log warning
+        if not slide_text_parts and not notes_text:
+            append_journal(
+                dest_root,
+                journal_event(
+                    "file_skipped",
+                    step=1,
+                    source=str(source_path),
+                    reason="image-only slide",
+                    slide=slide_num,
+                    cmd=state.command,
+                ),
+            )
+            continue
+
+        # Build slide content
+        slide_content = "\n\n".join(slide_text_parts)
+        if notes_text:
+            slide_content += f"\n\n## Speaker Notes\n{notes_text}"
+
+        slides_text.append(slide_content)
+
+    return "\n\n".join(slides_text)
+
+
+def _extract_xlsx(source_path: Path) -> str:
+    """Extract text from XLSX using openpyxl as markdown tables per sheet."""
+    wb = load_workbook(source_path, data_only=True)
+    sheets_text = []
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+
+        # Get all rows with data
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            continue
+
+        # Build markdown table
+        table_lines = [f"## {sheet_name}", ""]
+
+        # Convert rows to strings, handling None values
+        for row in rows:
+            cells = [str(cell) if cell is not None else "" for cell in row]
+            table_lines.append("| " + " | ".join(cells) + " |")
+
+        sheets_text.append("\n".join(table_lines))
+
+    wb.close()
+    return "\n\n".join(sheets_text)
+
+
 def extract_binary_doc(
     source_path: Path,
     dest_path: Path,
@@ -82,7 +250,88 @@ def extract_binary_doc(
     state: State,
     dest_root: Path,
 ) -> None:
-    raise NotImplementedError("Phase 2: binary document extraction not yet implemented")
+    """Extract text from binary documents (PDF, DOCX, PPTX, XLSX) and always call Claude."""
+    suffix = source_path.suffix.lower()
+
+    # Extract raw text based on format
+    if suffix == ".pdf":
+        raw_text = _extract_pdf(source_path)
+    elif suffix == ".docx":
+        raw_text = _extract_docx(source_path)
+    elif suffix == ".pptx":
+        raw_text = _extract_pptx(source_path, dest_root, state)
+    elif suffix == ".xlsx":
+        raw_text = _extract_xlsx(source_path)
+    else:
+        raise ValueError(f"Unsupported binary document format: {suffix}")
+
+    # Build front matter
+    front_matter = _build_front_matter(record, source_path)
+
+    # For PDF, handle chunking if text > 200KB
+    if suffix == ".pdf" and len(raw_text.encode("utf-8")) > 200_000:
+        # Split on line boundaries into 200KB chunks
+        lines = raw_text.splitlines()
+        chunks = []
+        current_chunk = []
+        current_size = 0
+
+        for line in lines:
+            line_bytes = len((line + "\n").encode("utf-8"))
+            if current_size + line_bytes > 200_000 and current_chunk:
+                chunks.append("\n".join(current_chunk))
+                current_chunk = [line]
+                current_size = line_bytes
+            else:
+                current_chunk.append(line)
+                current_size += line_bytes
+
+        if current_chunk:
+            chunks.append("\n".join(current_chunk))
+
+        # Call Claude on each chunk and concatenate
+        processed_parts = []
+        for chunk in chunks:
+            user_content = f"Source: {record.source_path}\n\nContent:\n{chunk}"
+            content = call_claude(
+                client,
+                HAIKU_MODEL,
+                prompts["extract_text"],
+                user_content,
+                MAX_TOKENS["extract"],
+                rpm,
+                state,
+                dest_root,
+            )
+            processed_parts.append(content)
+
+        final_content = "\n\n".join(processed_parts)
+    else:
+        # Always call Claude for binary docs
+        user_content = f"Source: {record.source_path}\n\nContent:\n{raw_text}"
+        final_content = call_claude(
+            client,
+            HAIKU_MODEL,
+            prompts["extract_text"],
+            user_content,
+            MAX_TOKENS["extract"],
+            rpm,
+            state,
+            dest_root,
+        )
+
+    # Write output
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    dest_path.write_text(front_matter + final_content, encoding="utf-8")
+
+
+_IMAGE_MEDIA_TYPES: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
 
 
 def extract_image(
@@ -95,7 +344,24 @@ def extract_image(
     state: State,
     dest_root: Path,
 ) -> None:
-    raise NotImplementedError("Phase 3: image extraction not yet implemented")
+    suffix = source_path.suffix.lower()
+    media_type = _IMAGE_MEDIA_TYPES[suffix]
+    image_data = source_path.read_bytes()
+    front_matter = _build_front_matter(record, source_path)
+    content = call_claude_vision(
+        client,
+        HAIKU_MODEL,
+        prompts["extract_image"],
+        image_data,
+        media_type,
+        f"Source: {record.source_path}",
+        MAX_TOKENS["image"],
+        rpm,
+        state,
+        dest_root,
+    )
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    dest_path.write_text(front_matter + content, encoding="utf-8")
 
 
 def extract_file(
@@ -111,9 +377,58 @@ def extract_file(
 
     if record.category == "text":
         extract_text_file(source_path, dest_path, record, prompts, client, rpm, state, dest_root)
-    elif record.category == "binary_doc":
+    elif record.category == "binary-doc":
         extract_binary_doc(source_path, dest_path, record, prompts, client, rpm, state, dest_root)
-    elif record.category == "image":
+    elif record.category == "binary-image":
         extract_image(source_path, dest_path, record, prompts, client, rpm, state, dest_root)
     else:
         raise ValueError(f"Unknown category: {record.category}")
+
+
+def run_extract_step(
+    records: list[ManifestFile],
+    prompts: dict[str, str],
+    client: anthropic.Anthropic,
+    rpm: int,
+    state: State,
+    dest_root: Path,
+    on_file: callable = None,
+) -> list[str]:
+    errors: list[str] = []
+    for record in records:
+        dest_path = Path(record.destination_path)
+        if dest_path.exists():
+            continue
+        if (
+            record.category in ("binary-doc", "binary-image")
+            and state.max_binary_mb > 0
+            and record.size_bytes > state.max_binary_mb * 1024 * 1024
+        ):
+            record.status = "skipped-oversized"
+            append_journal(
+                dest_root,
+                journal_event(
+                    "file_skipped",
+                    step=1,
+                    source=record.source_path,
+                    reason="oversized",
+                    size_bytes=record.size_bytes,
+                    cmd=state.command,
+                ),
+            )
+            continue
+        if on_file:
+            on_file(record.source_path)
+        try:
+            extract_file(record, prompts, client, rpm, state, dest_root)
+            record.status = "extracted"
+            state.completed_files.append(record.source_path)
+        except NotImplementedError as e:
+            record.status = "skipped"
+            errors.append(f"{record.source_path}: {e}")
+        except Exception as e:
+            record.status = "failed"
+            state.failed_files.append(record.source_path)
+            errors.append(f"{record.source_path}: {e}")
+            append_journal(dest_root, journal_event("file_error", file=record.source_path, error=str(e), cmd=state.command))
+    return errors

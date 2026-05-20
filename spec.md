@@ -118,6 +118,9 @@ system=[{"type": "text", "text": prompt_text, "cache_control": {"type": "ephemer
 ### Process
 
 1. Walk `<source>` recursively, collect all file paths.
+
+Symlinks encountered during the walk are excluded from the manifest, logged as `file_skipped` journal events with `"step": 0, "reason": "symlink"`, and printed as console warnings.
+
 2. Classify each file (see File Classification below).
 3. Create matching directory structure at `<destination>`.
 4. Write `manifest.json`.
@@ -126,10 +129,14 @@ system=[{"type": "text", "text": prompt_text, "cache_control": {"type": "ephemer
 
 | Category | Extensions | Handler |
 |----------|-----------|---------|
-| `text` | `.txt`, `.md`, `.csv`, `.json`, `.yaml`, `.yml`, `.xml`, `.html`, `.java`, `.py`, `.js`, `.ts`, `.sql`, `.rst` | Text extraction |
+| `text` | `.txt`, `.md`, `.csv`, `.json`, `.yaml`, `.yml`, `.xml`, `.html`, `.java`, `.py`, `.js`, `.ts`, `.sql`, `.rst`, `.svg` | Text extraction |
 | `binary-doc` | `.pdf`, `.docx`, `.pptx`, `.xlsx` | OCR/parse extraction |
-| `binary-image` | `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.svg` | Visual analysis |
+| `binary-image` | `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp` | Visual analysis |
 | `skip` | `.DS_Store`, `.gitignore`, `*.lock`, `node_modules/**` | Ignored |
+
+SVG is classified as `text` (it is XML); it is copied verbatim without an API call unless complexity signals are detected.
+
+Binary files (`binary-doc`, `binary-image`) larger than `--max-binary-mb` (default 50 MB, 0 = unlimited) are classified as `skipped-oversized` at Step 0 and never sent to Claude. A `file_skipped` journal event is written and the file is listed in the final summary.
 
 ### manifest.json schema
 
@@ -153,6 +160,11 @@ system=[{"type": "text", "text": prompt_text, "cache_control": {"type": "ephemer
 }
 ```
 
+Valid `status` values: `"pending"` (not yet processed), `"completed"` (output written successfully), `"failed"` (error during processing, see `state.json.failed_files`), `"skipped-oversized"` (binary file exceeded `--max-binary-mb`).
+
+```json
+```
+
 ---
 
 ## Step 1 — Extraction (Map)
@@ -164,10 +176,16 @@ system=[{"type": "text", "text": prompt_text, "cache_control": {"type": "ephemer
 
 **Pass 1 (always): Python-only extraction**
 
-Read raw text. If none of the following complexity signals are present, write the output directly without an API call:
-- Tables detected (delimiter-aligned columns, `|`-separated rows)
-- Repeated header/footer lines across pages or sections
-- Embedded image references
+Read raw text.
+
+Encoding strategy: UTF-8 is attempted first. On `UnicodeDecodeError`, latin-1 is tried. If latin-1 also fails, UTF-8 with `errors='replace'` is used as final fallback.
+
+If none of the following complexity signals are present, write the output directly without an API call:
+- Tables detected (`|`-separated rows where the line starts with `|`)
+- Aligned columns (two or more consecutive spaces appearing mid-line, on 3 or more lines)
+- Repeated lines (same non-empty line of more than 10 characters appearing 3 or more times)
+
+**Large file chunking**: If the raw text exceeds 500,000 bytes (UTF-8-encoded), the file is treated as complex regardless of complexity signals and the two-pass check is skipped. The text is split into chunks of ≤ 500,000 bytes on line boundaries; Claude is called on each chunk; the outputs are concatenated before writing the output file.
 
 **Pass 2 (conditional): Claude cleanup**
 
@@ -190,10 +208,10 @@ Content: {raw_text}
 Always performs Python extraction first; always sends to Claude for cleanup (binary formats reliably contain complex structure).
 
 Local extraction per format:
-- **PDF**: `pymupdf` (`page.get_text("text")`); detect repeated footer lines via frequency analysis (line on ≥80% of pages = footer candidate)
-- **DOCX**: `python-docx`; footer sections are explicit
-- **PPTX**: `python-pptx`; slide text extracted; speaker notes appended under `## Speaker Notes`
-- **XLSX**: `openpyxl`; each sheet extracted as a markdown table; sheet names used as `## {Sheet Name}` headings
+- **PDF**: `pymupdf` (`page.get_text("text")`); detect repeated header and footer lines via frequency analysis (line appearing on ≥80% of pages = header/footer candidate, stripped before Claude pass). If the extracted text exceeds 200 KB, split into 200 KB chunks, call Claude on each chunk, and concatenate the results before writing the output file.
+- **DOCX**: `python-docx`; header and footer sections are explicit in the format and stripped directly.
+- **PPTX**: `python-pptx`; text extracted per slide; speaker notes appended under `## Speaker Notes`. Slides that contain no text (image-only slides) are logged as a `file_skipped` journal event with `"reason": "image-only slide"` and skipped — they do not produce an empty block.
+- **XLSX**: `openpyxl`; each sheet extracted as a markdown table under `## {Sheet Name}`. Empty cells render as an empty table cell. Merged cells: the value is written in the first (top-left) cell of the merge; all other cells in the merge render empty.
 
 Claude prompt (same as text Pass 2 above, applied to extracted text).
 
@@ -203,11 +221,9 @@ Sent directly to Haiku vision (base64-encoded). No local pre-processing beyond r
 
 ```
 Analyze this image.
-1. Identify the diagram type: one of [generic-schema, relational-data-model, uml-class, uml-sequence, uml-activity, uml-component, flowchart, wireframe, chart-data, screenshot, photo, other].
+1. Identify the diagram type: one of [generic-schema, flowchart, wireframe, chart-data, screenshot, photo, other].
 2. Write a high-level summary (3–5 sentences) describing the content and purpose.
-3. If the diagram type supports PlantUML representation, produce a faithful PlantUML block.
-   Supported types: relational-data-model, uml-class, uml-sequence, uml-activity, uml-component, flowchart.
-4. If PlantUML is not applicable, produce the best available markdown representation (table, ASCII, description).
+3. Produce the best available markdown representation (table, ASCII art, or description paragraph).
 
 Output format exactly:
 ## Diagram Type
@@ -217,10 +233,8 @@ Output format exactly:
 {summary}
 
 ## Representation
-{plantuml or markdown block}
+{markdown block}
 ```
-
-PlantUML blocks are validated with the `plantuml` library before writing. Validation failures are logged to `journal.jsonl` as `plantuml_warning` events; the unvalidated block is written regardless.
 
 ### Output file header (all categories)
 
@@ -392,10 +406,12 @@ One JSON object per line. Append-only.
 
 ```json
 {"ts": "ISO8601", "cmd": "ingest", "event": "step_start", "step": 0, "detail": null}
+{"ts": "ISO8601", "cmd": "ingest", "event": "file_skipped", "step": 0, "source": "/source/link.py", "reason": "symlink"}
+{"ts": "ISO8601", "cmd": "ingest", "event": "file_skipped", "step": 1, "source": "/source/deck.pptx", "reason": "image-only slide", "slide": 3}
+{"ts": "ISO8601", "cmd": "ingest", "event": "file_skipped", "step": 1, "source": "/source/large.bin", "reason": "oversized", "size_bytes": 104857600}
 {"ts": "ISO8601", "cmd": "ingest", "event": "file_extracted", "step": 1, "source": "/source/moduleA/doc1.pdf", "dest": "/context/moduleA/doc1.md", "agent": "haiku", "tokens": 1240}
 {"ts": "ISO8601", "cmd": "ingest", "event": "file_summarized", "step": 2, "source": "/context/moduleA/doc1.md", "dest": "/context/moduleA/_summary_doc1.md", "agent": "haiku", "tokens": 340}
 {"ts": "ISO8601", "cmd": "ingest", "event": "api_call", "input_tokens": 3200, "output_tokens": 840, "cumulative_tokens": 42100}
-{"ts": "ISO8601", "cmd": "ingest", "event": "plantuml_warning", "file": "/context/moduleA/schema.md", "detail": "syntax validation failed"}
 {"ts": "ISO8601", "cmd": "ingest", "event": "file_error", "step": 1, "source": "/source/moduleA/doc1.pdf", "error": "..."}
 {"ts": "ISO8601", "cmd": "ingest", "event": "step_complete", "step": 4, "detail": "index.md written"}
 {"ts": "ISO8601", "cmd": "ingest", "event": "pipeline_complete", "total_files": 42, "total_tokens": 98400, "elapsed_seconds": 312}
@@ -421,6 +437,8 @@ Existing ingest state detected (step {N}/4). Resume? [y/N/amend]
 - `N` → abort
 - `amend` → equivalent to `/ingest-amend <source>`
 
+If `--rpm` is explicitly passed on resume, it overrides the value stored in `state.json` and the new value is written back. If omitted, the stored value is used.
+
 ---
 
 ## Commands
@@ -434,18 +452,20 @@ Full pipeline execution from scratch.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--rpm INT` | `60` | Maximum API requests per minute. Sleep interval = `60 / rpm` seconds between calls. |
+| `--max-binary-mb INT` | `50` | Binary files (`binary-doc`, `binary-image`) larger than this threshold are skipped. Set to `0` to disable the limit. |
 
 ```
+0. Abort with a clear error message if ANTHROPIC_API_KEY is not set.
 1. Validate source path exists.
 2. Create destination directory.
 3. Initialize .ingest/manifest.json, state.json, journal.jsonl.
-4. Execute Step 0 → manifest population.
+4. Execute Step 0 → manifest population (applies --max-binary-mb classification).
 5. Execute Step 1 → all files sequentially, throttled to --rpm.
 6. Execute Step 2 → bottom-up per directory.
 7. Execute Step 3 → reduce loop until root.
 8. Execute Step 4 → index.md.
 9. Write final journal entry: pipeline_complete.
-10. Print summary: files processed, tokens used, elapsed time, errors.
+10. Print summary: files processed, tokens used, elapsed time, errors, skipped-oversized files.
 ```
 
 ### `uv run ingest-add <source>`
@@ -454,19 +474,21 @@ Adds a new subdirectory from the original source tree to an existing context.
 
 `<source>` is an absolute path rooted at the current working directory. It must be a subdirectory of the `source_root` recorded in `manifest.json`. The destination path is derived automatically by replacing the `source_root` prefix with `destination_root`.
 
-**Flags:** same `--rpm` flag as `ingest`.
+**Flags:** same `--rpm` and `--max-binary-mb` flags as `ingest`.
 
 ```
 Pre-conditions:
 - destination/.ingest/manifest.json must exist
 - <source> prefix must match manifest.source_root
+- Files already present in manifest (matched by source_path) are skipped — no duplicate records are appended.
+  A warning is printed for each skipped duplicate; use ingest-amend to reprocess them.
 
 1. Resolve destination path: dest = source.replace(source_root, destination_root)
 2. Create dest directory if absent.
-3. Classify new files; append records to manifest.json with status "pending".
+3. Classify new files; append records to manifest.json with status "pending" for files not already present.
 4. Execute Step 1 for new files only, throttled to --rpm.
 5. Execute Step 2 for new files only.
-6. Re-execute Step 3 upward from the lowest affected directory to root (_reduce_root.md).
+6. Re-execute Step 3 upward from the lowest affected directory to root via run_reduce_from_dir(start_dir).
 7. Re-execute Step 4 → regenerate index.md.
 8. Append journal entries; update state.json.last_updated.
 ```
@@ -480,9 +502,14 @@ Journal event:
 
 Full reset and reprocessing of a source directory.
 
-**Flags:** same `--rpm` flag as `ingest`.
+**Flags:** same `--rpm` and `--max-binary-mb` flags as `ingest`.
 
 ```
+Pre-conditions:
+- destination/.ingest/manifest.json must exist.
+- At least one manifest record must have a source_path under <source>.
+  If no records match, abort with: "No manifest records found for <source>. Nothing to amend."
+
 1. Delete all generated files under destination that originate from <source>:
    - Match via manifest.json source_path prefix.
    - Remove extracted .md, _summary_*.md, affected _reduce_*.md, index.md.
@@ -510,8 +537,6 @@ python-docx      # DOCX extraction
 python-pptx      # PPTX extraction
 openpyxl         # XLSX extraction
 anthropic        # Claude API (Sonnet + Haiku)
-Pillow           # image pre-processing
-plantuml         # PlantUML syntax validation (non-blocking)
 click            # CLI
 rich             # progress bar
 ```
@@ -520,7 +545,7 @@ rich             # progress bar
 
 All API calls are strictly sequential with a configurable sleep between each call. No parallel workers. Steps execute in order; within a step, files are processed one at a time.
 
-The `--rpm` flag (default `60`) controls throughput. Sleep interval is computed as `60.0 / rpm` seconds. The `rpm` value is recorded in `state.json` at run start and reused on resume.
+The `--rpm` flag (default `60`) controls throughput. Sleep interval is computed as `60.0 / rpm` seconds. The `rpm` value is recorded in `state.json` at run start and reused on resume (CLI override takes precedence). The `--max-binary-mb` value is also recorded in `state.json` and reused on resume; a CLI override takes precedence.
 
 ```python
 def call_api(client, rpm: int, **kwargs):
@@ -554,18 +579,62 @@ No truncation. Input and output tokens are logged to journal per call. Running t
 
 Each Claude call is a pure content transformation. Python constructs the full prompt from files under `prompts/` and writes the output. No state is inferred by the model.
 
+### Text calls — `call_claude()`
+
 ```python
-def call_claude(client, model, system_prompt, user_content, max_tokens, rpm: int):
-    time.sleep(60.0 / rpm)
-    response = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
-        messages=[{"role": "user", "content": user_content}]
-    )
-    log_tokens(response.usage.input_tokens, response.usage.output_tokens)
-    return response.content[0].text
+def call_claude(client, model, system_prompt, user_content: str, max_tokens, rpm, state, dest_root):
+    sleep_interval = 60.0 / rpm
+    for attempt in range(3):
+        time.sleep(sleep_interval)
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
+                messages=[{"role": "user", "content": user_content}]
+            )
+            # log tokens to journal and persist state
+            state.total_input_tokens += response.usage.input_tokens
+            state.total_output_tokens += response.usage.output_tokens
+            append_journal(dest_root, journal_event("api_call", model=model,
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+                cumulative_tokens=state.total_input_tokens + state.total_output_tokens))
+            save_state(dest_root, state)
+            return response.content[0].text
+        except RateLimitError:
+            if attempt == 2:
+                raise
+            sleep_interval = 2 * (60.0 / rpm)
+        except APIStatusError as e:
+            if e.status_code < 500 or attempt == 2:  # only retry on 5xx
+                raise
+            sleep_interval = 2 * (60.0 / rpm)
 ```
+
+### Vision calls — `call_claude_vision()`
+
+Used exclusively for `binary-image` files. Takes raw image bytes and encodes them as base64 inline.
+
+```python
+def call_claude_vision(client, model, system_prompt, image_data: bytes, media_type: str,
+                       prompt_text: str, max_tokens, rpm, state, dest_root):
+    b64_data = base64.standard_b64encode(image_data).decode("ascii")
+    content = [
+        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64_data}},
+        {"type": "text", "text": prompt_text},
+    ]
+    # same retry/logging/save_state pattern as call_claude(), using multipart content
+```
+
+Media type mapping for supported extensions: `png → image/png`, `jpg/jpeg → image/jpeg`, `gif → image/gif`, `webp → image/webp`.
+
+### Retry and logging rules (both functions)
+
+- On `RateLimitError`: retry up to 2 times (3 attempts total) with doubled sleep interval.
+- On `APIStatusError`: retry only on HTTP 5xx responses. 4xx errors (including 400, 401, 403) are not retried and propagate immediately.
+- After each successful call: append an `api_call` journal event (model, input_tokens, output_tokens, cumulative_tokens) and call `save_state()`.
+- The third failure propagates and is caught by `run_extract_step` as a `file_error` journal event.
 
 Models used:
 - `claude-haiku-4-5-20251001` — extraction cleanup, image analysis, summary, reduce

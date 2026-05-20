@@ -13,15 +13,20 @@ def test_classify_text_extensions() -> None:
 
 
 def test_classify_binary_doc() -> None:
-    assert classify_file(Path("report.pdf")) == "binary_doc"
-    assert classify_file(Path("doc.docx")) == "binary_doc"
-    assert classify_file(Path("slides.pptx")) == "binary_doc"
-    assert classify_file(Path("data.xlsx")) == "binary_doc"
+    assert classify_file(Path("report.pdf")) == "binary-doc"
+    assert classify_file(Path("doc.docx")) == "binary-doc"
+    assert classify_file(Path("slides.pptx")) == "binary-doc"
+    assert classify_file(Path("data.xlsx")) == "binary-doc"
 
 
 def test_classify_image() -> None:
-    assert classify_file(Path("photo.png")) == "image"
-    assert classify_file(Path("icon.svg")) == "image"
+    assert classify_file(Path("photo.png")) == "binary-image"
+    assert classify_file(Path("icon.gif")) == "binary-image"
+    assert classify_file(Path("bg.webp")) == "binary-image"
+
+
+def test_classify_svg_as_text() -> None:
+    assert classify_file(Path("diagram.svg")) == "text"
 
 
 def test_classify_skip_names() -> None:

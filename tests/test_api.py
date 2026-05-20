@@ -98,3 +98,6 @@ def test_call_claude_writes_journal(tmp_path: Path, mock_client: MagicMock) -> N
     entry = json.loads(lines[0])
     assert entry["event"] == "api_call"
     assert entry["model"] == "mymodel"
+    assert entry["input_tokens"] == 100
+    assert entry["output_tokens"] == 50
+    assert entry["cumulative_tokens"] == 150

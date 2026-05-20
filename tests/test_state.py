@@ -96,4 +96,4 @@ def test_journal_append(tmp_path: Path) -> None:
     first = json.loads(lines[0])
     assert first["event"] == "test_event"
     assert first["key"] == "value"
-    assert "timestamp" in first
+    assert "ts" in first

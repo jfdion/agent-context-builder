@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 from typing import Iterator
 
@@ -21,19 +22,30 @@ def classify_file(path: Path) -> str | None:
     if suffix in TEXT_EXTENSIONS:
         return "text"
     if suffix in BINARY_DOC_EXTENSIONS:
-        return "binary_doc"
+        return "binary-doc"
     if suffix in BINARY_IMAGE_EXTENSIONS:
-        return "image"
+        return "binary-image"
     return None
 
 
 def walk_source(source_root: Path) -> Iterator[Path]:
     for path in sorted(source_root.rglob("*")):
+        if path.is_symlink():
+            continue
         if path.is_dir():
             continue
         if any(part in SKIP_DIRS for part in path.parts):
             continue
         yield path
+
+
+def find_symlinks(source_root: Path) -> list[Path]:
+    result = []
+    for path in sorted(source_root.rglob("*")):
+        if path.is_symlink():
+            if not any(part in SKIP_DIRS for part in path.parts):
+                result.append(path)
+    return result
 
 
 def mirror_dirs(source_root: Path, dest_root: Path) -> None:
@@ -54,19 +66,19 @@ def dest_path_for(source_path: Path, source_root: Path, dest_root: Path) -> Path
 def build_manifest_files(
     source_root: Path,
     dest_root: Path,
-) -> list[ManifestFile]:
+) -> tuple[list[ManifestFile], list[Path]]:
     from datetime import datetime, timezone
-    import hashlib
 
     records: list[ManifestFile] = []
+    symlinks = find_symlinks(source_root)
+
     for path in walk_source(source_root):
         category = classify_file(path)
         if category is None:
             continue
         stat = path.stat()
         mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
-        rel = path.relative_to(source_root)
-        file_id = hashlib.sha256(str(rel).encode()).hexdigest()[:16]
+        file_id = f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
         dest = dest_path_for(path, source_root, dest_root)
         records.append(ManifestFile(
             id=file_id,
@@ -77,4 +89,4 @@ def build_manifest_files(
             mtime=mtime,
             status="pending",
         ))
-    return records
+    return records, symlinks

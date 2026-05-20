@@ -17,7 +17,7 @@ TEXT_EXTENSIONS: frozenset[str] = frozenset({
     ".xml", ".html", ".java", ".py", ".js", ".ts",
     ".sql", ".rst", ".toml", ".ini", ".cfg", ".sh",
     ".bash", ".zsh", ".go", ".rb", ".rs", ".c", ".h",
-    ".cpp", ".hpp", ".cs", ".kt", ".swift",
+    ".cpp", ".hpp", ".cs", ".kt", ".swift", ".svg",
 })
 
 BINARY_DOC_EXTENSIONS: frozenset[str] = frozenset({
@@ -25,7 +25,7 @@ BINARY_DOC_EXTENSIONS: frozenset[str] = frozenset({
 })
 
 BINARY_IMAGE_EXTENSIONS: frozenset[str] = frozenset({
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp",
 })
 
 SKIP_NAMES: frozenset[str] = frozenset({

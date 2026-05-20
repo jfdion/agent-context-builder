@@ -56,7 +56,7 @@ def test_pipeline_creates_index(tmp_path: Path, small_source: Path, prompts_dir:
     ):
         run_ingest(small_source, dest, rpm=60, prompts_dir=prompts_dir)
 
-    assert (dest / "_index.md").exists()
+    assert (dest / "index.md").exists()
 
 
 def test_pipeline_resumable(tmp_path: Path, small_source: Path, prompts_dir: Path) -> None:
@@ -78,7 +78,7 @@ def test_pipeline_resumable(tmp_path: Path, small_source: Path, prompts_dir: Pat
         patch("ingest_pipeline.pipeline.anthropic.Anthropic", return_value=mock_client2),
         patch("ingest_pipeline.api.time.sleep"),
         patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
-        patch("ingest_pipeline.pipeline.click.confirm", return_value=False),
+        patch("ingest_pipeline.ui.confirm_resume", return_value=False),
     ):
         run_ingest(small_source, dest, rpm=60, prompts_dir=prompts_dir)
 

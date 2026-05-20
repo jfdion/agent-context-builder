@@ -40,6 +40,7 @@ class State:
     failed_files: list[str]
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    max_binary_mb: int = 50
 
 
 def ingest_dir(dest_root: Path) -> Path:
@@ -90,7 +91,7 @@ def load_state(dest_root: Path) -> State | None:
 
 def journal_event(event_type: str, **kwargs) -> dict:
     return {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(timezone.utc).isoformat(),
         "event": event_type,
         **kwargs,
     }

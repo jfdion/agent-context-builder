@@ -117,14 +117,36 @@ def test_extract_file_dispatches_to_text(tmp_path: Path, mock_client: MagicMock)
     assert dest_file.exists()
 
 
-def test_extract_file_binary_doc_raises(tmp_path: Path, mock_client: MagicMock) -> None:
+def test_extract_file_binary_doc_calls_extractor(tmp_path: Path, mock_client: MagicMock) -> None:
+    """Test that extract_file dispatches binary-doc to extract_binary_doc."""
+    src = tmp_path / "doc.pdf"
+    src.write_bytes(b"fake pdf content")
     dest = tmp_path / "dest"
     dest.mkdir()
+    ingest_dir(dest).mkdir()
+    dest_file = dest / "doc.md"
+
     record = ManifestFile(
-        id="x", source_path="/src/doc.pdf", destination_path=str(dest / "doc.md"),
-        category="binary_doc", size_bytes=0,
+        id="x", source_path=str(src), destination_path=str(dest_file),
+        category="binary-doc", size_bytes=100,
         mtime=datetime.now(timezone.utc).isoformat(), status="pending",
     )
     state = _make_state(dest)
-    with pytest.raises(NotImplementedError):
-        extract_file(record, {}, mock_client, 60, state, dest)
+    prompts = {"extract_text": "Extract text prompt"}
+
+    # Mock the PDF extraction and Claude call
+    with patch("ingest_pipeline.extract.fitz") as mock_fitz:
+        mock_doc = MagicMock()
+        mock_page = MagicMock()
+        mock_page.get_text.return_value = "Page content"
+        mock_doc.__iter__ = MagicMock(return_value=iter([mock_page]))
+        mock_doc.__len__ = MagicMock(return_value=1)
+        mock_fitz.open.return_value = mock_doc
+
+        with patch("ingest_pipeline.extract.call_claude", return_value="Extracted PDF"):
+            extract_file(record, prompts, mock_client, 60, state, dest)
+
+    assert dest_file.exists()
+    content = dest_file.read_text(encoding="utf-8")
+    assert "source:" in content
+    assert "Extracted PDF" in content
