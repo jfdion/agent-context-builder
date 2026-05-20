@@ -4,17 +4,19 @@ A map-reduce pipeline that transforms a source directory tree of text and binary
 
 ## Installation
 
-**Prerequisites:** Python 3.13+ and an [Anthropic API key](https://console.anthropic.com/).
+**Prerequisites:** Python 3.13+ and [`uv`](https://docs.astral.sh/uv/).
 
-**With [`uv`](https://docs.astral.sh/uv/) (recommended):**
 ```bash
 git clone https://github.com/jfdion/agent-context-builder
 cd agent-context-builder
 uv sync
-export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-The three CLI commands are then available via `uv run <command>` or inside an activated `.venv`.
+An [Anthropic API key](https://console.anthropic.com/) is required for the Python CLI commands (`-api` suffix) but **not** for the Claude Code slash commands, which use your active Claude Code session instead.
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...   # required for uv run / /ingest-api commands only
+```
 
 ## Suggested Workflow
 
@@ -42,17 +44,20 @@ source/          →      context/
 |------|------|--------------|
 | 0 | **Walk** | Scans source, mirrors directory tree, builds a manifest with SHA-256 fingerprints for each file. |
 | 1 | **Extract** | Converts each file to Markdown. Text files are read directly; PDFs/DOCX/PPTX/XLSX are parsed with their respective libraries; images are described via Claude vision. |
-| 2 | **Summarize** | Generates a concise `_summary_<name>.md` for every extracted file using Claude Haiku. |
+| 2 | **Summarize** | Generates a concise `_summary_<name>.md` for every extracted file. |
 | 3 | **Reduce** | Bottom-up roll-up: for each directory, combines its summaries into a single `_reduce_<dir>.md`, then propagates upward to the root. |
 | 4 | **Index** | Writes `index.md` — the canonical entry point for the knowledge base — covering directory structure, key concepts, and file purposes. |
 
 **Supported file types:** `.txt`, `.md`, `.csv`, `.json`, `.yaml`, `.py`, `.js`, `.ts`, `.go`, `.rs`, `.java`, `.cs`, `.sql`, `.html`, `.xml`, `.sh` and other text formats; `.pdf`, `.docx`, `.pptx`, `.xlsx`; `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`.
 
-**Resumability:** if a run is interrupted, re-running `ingest` on the same destination will offer to resume from the last completed step.
+**Resumability:** if a run is interrupted, re-running `ingest-api` on the same destination will offer to resume from the last completed step.
 
 ### Commands
 
-**Terminal (`uv run`):**
+There are two ways to run the pipeline: the **Python CLI** (requires `ANTHROPIC_API_KEY`) and **Claude Code slash commands** (uses your active session, no key needed).
+
+#### Python CLI (`uv run`)
+
 ```bash
 # Full ingest (with resume support)
 uv run ingest <source> <destination> [--rpm 60] [--max-binary-mb 50]
@@ -64,22 +69,34 @@ uv run ingest-add <source-subdir> <destination>
 uv run ingest-amend <source-subdir> <destination>
 ```
 
-**Claude Code slash commands** (from within a Claude Code session in this repo):
-```
-/ingest <source> <destination> [--rpm INT] [--max-binary-mb INT]
-/ingest-add <source-subdir> <destination> [--rpm INT] [--max-binary-mb INT]
-/ingest-amend <source-subdir> <destination> [--rpm INT] [--max-binary-mb INT]
-```
+#### Claude Code slash commands
+
+Six commands are available from within a Claude Code session in this repo:
+
+| Command | Backend | Description |
+|---------|---------|-------------|
+| `/ingest <source> <destination>` | Agent (parallel) | Full pipeline — Sonnet orchestrates, Haiku processes files in parallel, Opus builds the index |
+| `/ingest-add <source-subdir> <destination>` | Agent (parallel) | Add a new subdirectory, re-reduce and re-index |
+| `/ingest-amend <source-subdir> <destination>` | Agent (parallel) | Reset and re-process a subdirectory, re-reduce and re-index |
+| `/ingest-api <source> <destination> [--rpm INT] [--max-binary-mb INT]` | Python CLI | Same as `uv run ingest`; requires `ANTHROPIC_API_KEY` |
+| `/ingest-add-api <source-subdir> <destination> [--rpm INT] [--max-binary-mb INT]` | Python CLI | Same as `uv run ingest-add`; requires `ANTHROPIC_API_KEY` |
+| `/ingest-amend-api <source-subdir> <destination> [--rpm INT] [--max-binary-mb INT]` | Python CLI | Same as `uv run ingest-amend`; requires `ANTHROPIC_API_KEY` |
+
+The agent commands (`/ingest`, `/ingest-add`, `/ingest-amend`) use a multi-agent architecture:
+
+- **Sonnet** (orchestrator) — walks the source tree, builds the manifest, batches work, and coordinates phases.
+- **Haiku** (parallel workers) — extract, summarize, and reduce steps; files are batched (≤10 per agent) and all batches within a phase run simultaneously.
+- **Opus** (index builder) — generates `index.md` from the completed reduce tree.
 
 ### Custom prompts
 
-All Claude prompts are plain text files loaded at startup. Pass `--prompts-dir` to use a custom directory instead of the built-in `prompts/`:
+All prompts are plain text files under `prompts/`. The agent commands read these files at runtime, so edits apply to both backends.
+
+Pass `--prompts-dir` to the Python CLI to use a different directory:
 
 ```bash
 uv run ingest <source> <destination> --prompts-dir ./my-prompts
 ```
-
-The directory must contain all five prompt files:
 
 | File | Step | Purpose |
 |------|------|---------|
