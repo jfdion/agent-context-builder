@@ -9,9 +9,28 @@ from docx import Document
 from pptx import Presentation
 from openpyxl import load_workbook
 
-from .config import HAIKU_MODEL, MAX_TOKENS
+from .config import CHUNK_SIZE_BYTES, HAIKU_MODEL, MAX_TOKENS
 from .api import call_claude, call_claude_vision
 from .state import ManifestFile, State, append_journal, journal_event
+
+
+def _chunk_text(text: str, chunk_size: int) -> list[str]:
+    """Split text into chunks of at most chunk_size bytes on line boundaries."""
+    lines = text.splitlines()
+    chunks: list[str] = []
+    current: list[str] = []
+    current_size = 0
+    for line in lines:
+        line_bytes = len((line + "\n").encode("utf-8"))
+        if current_size + line_bytes > chunk_size and current:
+            chunks.append("\n".join(current))
+            current, current_size = [line], line_bytes
+        else:
+            current.append(line)
+            current_size += line_bytes
+    if current:
+        chunks.append("\n".join(current))
+    return chunks if chunks else [""]
 
 
 def has_complexity_signals(text: str) -> bool:
@@ -69,24 +88,7 @@ def extract_text_file(
     front_matter = _build_front_matter(record, source_path)
 
     if len(raw_text.encode("utf-8")) > 500_000:
-        lines = raw_text.splitlines()
-        chunks = []
-        current_chunk: list[str] = []
-        current_size = 0
-
-        for line in lines:
-            line_bytes = len((line + "\n").encode("utf-8"))
-            if current_size + line_bytes > 500_000 and current_chunk:
-                chunks.append("\n".join(current_chunk))
-                current_chunk = [line]
-                current_size = line_bytes
-            else:
-                current_chunk.append(line)
-                current_size += line_bytes
-
-        if current_chunk:
-            chunks.append("\n".join(current_chunk))
-
+        chunks = _chunk_text(raw_text, 500_000)
         processed_parts = []
         for chunk in chunks:
             user_content = f"Source: {record.source_path}\n\nContent:\n{chunk}"
@@ -121,7 +123,7 @@ def extract_text_file(
     dest_path.write_text(front_matter + content, encoding="utf-8")
 
 
-def _extract_pdf(source_path: Path) -> str:
+def extract_pdf(source_path: Path) -> str:
     """Extract text from PDF using pymupdf with header/footer stripping."""
     doc = fitz.open(source_path)
 
@@ -162,15 +164,18 @@ def _extract_pdf(source_path: Path) -> str:
     return "\n\n".join(all_text)
 
 
-def _extract_docx(source_path: Path) -> str:
+def extract_docx(source_path: Path) -> str:
     """Extract text from DOCX using python-docx, excluding headers/footers."""
     doc = Document(source_path)
     paragraphs = [para.text for para in doc.paragraphs if para.text.strip()]
     return "\n\n".join(paragraphs)
 
 
-def _extract_pptx(source_path: Path, dest_root: Path, state: State) -> str:
-    """Extract text from PPTX using python-pptx, including speaker notes."""
+def extract_pptx(source_path: Path, warnings: list[dict]) -> str:
+    """Extract text from PPTX using python-pptx, including speaker notes.
+
+    Image-only slides are recorded as dicts in warnings (caller writes journal events).
+    """
     prs = Presentation(source_path)
     slides_text = []
 
@@ -188,19 +193,9 @@ def _extract_pptx(source_path: Path, dest_root: Path, state: State) -> str:
         if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
             notes_text = slide.notes_slide.notes_text_frame.text.strip()
 
-        # If slide has no text at all, log warning
+        # If slide has no text at all, record warning for caller
         if not slide_text_parts and not notes_text:
-            append_journal(
-                dest_root,
-                journal_event(
-                    "file_skipped",
-                    step=1,
-                    source=str(source_path),
-                    reason="image-only slide",
-                    slide=slide_num,
-                    cmd=state.command,
-                ),
-            )
+            warnings.append({"reason": "image-only slide", "slide": slide_num})
             continue
 
         # Build slide content
@@ -213,7 +208,7 @@ def _extract_pptx(source_path: Path, dest_root: Path, state: State) -> str:
     return "\n\n".join(slides_text)
 
 
-def _extract_xlsx(source_path: Path) -> str:
+def extract_xlsx(source_path: Path) -> str:
     """Extract text from XLSX using openpyxl as markdown tables per sheet."""
     wb = load_workbook(source_path, data_only=True)
     sheets_text = []
@@ -255,41 +250,28 @@ def extract_binary_doc(
 
     # Extract raw text based on format
     if suffix == ".pdf":
-        raw_text = _extract_pdf(source_path)
+        raw_text = extract_pdf(source_path)
     elif suffix == ".docx":
-        raw_text = _extract_docx(source_path)
+        raw_text = extract_docx(source_path)
     elif suffix == ".pptx":
-        raw_text = _extract_pptx(source_path, dest_root, state)
+        pptx_warnings: list[dict] = []
+        raw_text = extract_pptx(source_path, pptx_warnings)
+        for w in pptx_warnings:
+            append_journal(
+                dest_root,
+                journal_event("file_skipped", step=1, source=str(source_path), cmd=state.command, **w),
+            )
     elif suffix == ".xlsx":
-        raw_text = _extract_xlsx(source_path)
+        raw_text = extract_xlsx(source_path)
     else:
         raise ValueError(f"Unsupported binary document format: {suffix}")
 
     # Build front matter
     front_matter = _build_front_matter(record, source_path)
 
-    # For PDF, handle chunking if text > 200KB
-    if suffix == ".pdf" and len(raw_text.encode("utf-8")) > 200_000:
-        # Split on line boundaries into 200KB chunks
-        lines = raw_text.splitlines()
-        chunks = []
-        current_chunk = []
-        current_size = 0
-
-        for line in lines:
-            line_bytes = len((line + "\n").encode("utf-8"))
-            if current_size + line_bytes > 200_000 and current_chunk:
-                chunks.append("\n".join(current_chunk))
-                current_chunk = [line]
-                current_size = line_bytes
-            else:
-                current_chunk.append(line)
-                current_size += line_bytes
-
-        if current_chunk:
-            chunks.append("\n".join(current_chunk))
-
-        # Call Claude on each chunk and concatenate
+    # For PDF, handle chunking if text > CHUNK_SIZE_BYTES
+    if suffix == ".pdf" and len(raw_text.encode("utf-8")) > CHUNK_SIZE_BYTES:
+        chunks = _chunk_text(raw_text, CHUNK_SIZE_BYTES)
         processed_parts = []
         for chunk in chunks:
             user_content = f"Source: {record.source_path}\n\nContent:\n{chunk}"

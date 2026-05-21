@@ -5,10 +5,10 @@ from datetime import datetime, timezone
 import pytest
 
 from ingest_pipeline.extract import (
-    _extract_pdf,
-    _extract_docx,
-    _extract_pptx,
-    _extract_xlsx,
+    extract_pdf,
+    extract_docx,
+    extract_pptx,
+    extract_xlsx,
     extract_binary_doc,
     extract_image,
 )
@@ -60,7 +60,7 @@ def test_extract_pdf_simple(mock_fitz: MagicMock) -> None:
     mock_doc.__len__ = Mock(return_value=2)
     mock_fitz.open.return_value = mock_doc
 
-    result = _extract_pdf(Path("/fake/doc.pdf"))
+    result = extract_pdf(Path("/fake/doc.pdf"))
 
     assert "Page 1 content" in result
     assert "Page 2 content" in result
@@ -83,7 +83,7 @@ def test_extract_pdf_strips_headers_footers(mock_fitz: MagicMock) -> None:
     mock_doc.__len__ = Mock(return_value=5)
     mock_fitz.open.return_value = mock_doc
 
-    result = _extract_pdf(Path("/fake/doc.pdf"))
+    result = extract_pdf(Path("/fake/doc.pdf"))
 
     # Headers and footers should be stripped (appear on all 5 pages = 100% >= 80%)
     assert "Header Text" not in result
@@ -281,9 +281,10 @@ def test_extract_pptx_image_only_slide_warning(
     extract_binary_doc(src, dest_file, record, prompts, MagicMock(), 60, state, dest)
 
     # Check that journal warning was logged for slide 2
+    # append_journal(dest_root, event_dict) — event_dict is positional arg index 1
     warning_calls = [
         call for call in mock_append_journal.call_args_list
-        if len(call[0]) > 1 and call[0][1].get("event") == "file_skipped"
+        if call[0][1].get("event") == "file_skipped"
     ]
     assert len(warning_calls) == 1
     assert warning_calls[0][0][1]["slide"] == 2
@@ -359,7 +360,7 @@ def test_extract_xlsx_empty_cells(mock_load_workbook: MagicMock) -> None:
     mock_wb.__getitem__ = lambda self, key: sheet1
     mock_load_workbook.return_value = mock_wb
 
-    result = _extract_xlsx(Path("/fake/data.xlsx"))
+    result = extract_xlsx(Path("/fake/data.xlsx"))
 
     # None values should become empty strings
     assert "| Name |  | Age |" in result
@@ -581,7 +582,7 @@ def test_extract_xlsx_merged_cells(mock_load_workbook: MagicMock) -> None:
     mock_wb.__getitem__ = lambda self, key: sheet1
     mock_load_workbook.return_value = mock_wb
 
-    result = _extract_xlsx(Path("/fake/data.xlsx"))
+    result = extract_xlsx(Path("/fake/data.xlsx"))
 
     # Master cell value appears, slaves are empty
     assert "| Merged Title |  |  |" in result

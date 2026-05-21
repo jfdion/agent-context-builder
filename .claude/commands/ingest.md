@@ -15,10 +15,10 @@ Do this work yourself with Bash, Read, and Write tools.
 3. Classify each remaining file by extension (case-insensitive):
    - **text**: `.txt .md .csv .json .yaml .yml .xml .html .java .py .js .ts .sql .rst .toml .ini .cfg .sh .bash .zsh .go .rb .rs .c .h .cpp .hpp .cs .kt .swift .svg`
    - **binary-image**: `.png .jpg .jpeg .gif .webp`
-   - **binary-doc**: `.pdf .docx .pptx .xlsx` — mark status `skipped-agent`; no sub-agent will process these
+   - **binary-doc**: `.pdf .docx .pptx .xlsx` — mark status `pending`; extracted via `extract_doc` CLI
    - Unrecognized extensions: skip entirely
 
-4. Mirror the SOURCE directory tree under DESTINATION: `find SOURCE -mindepth 1 -type d | while read d; do mkdir -p "DESTINATION${d#SOURCE}"; done`
+4. Mirror the SOURCE directory tree under DESTINATION: for each subdirectory found recursively under SOURCE, create the corresponding path under DESTINATION with `mkdir -p`.
 
 5. For each classifiable file: `sha256sum FILE` and `stat -c%s FILE` for size.
 
@@ -81,14 +81,14 @@ Note: `destination_path` always uses `.md` as the extension regardless of the so
 
 ## Phase 1 — Extract (parallel Haiku agents)
 
-Collect all manifest records with status `pending` and category `text` or `binary-image`. Group them into batches of at most 10 files each.
+Collect all manifest records with status `pending`. Group them into batches of at most 10 files each.
 
 Spawn ALL batches as Haiku agents **simultaneously in a single message** (one Agent tool call per batch, all in the same response). Use `model="haiku"` for every extract agent.
 
 Construct each agent's prompt by filling in this template:
 
 ---
-You are an extraction sub-agent. Use your Read and Write tools to process each file in the list below.
+You are an extraction sub-agent. Use your Bash, Read, and Write tools to process each file in the list below.
 
 **Text extraction rules:**
 {{EXTRACT_TEXT_PROMPT}}
@@ -103,13 +103,17 @@ For each file:
 
 *If category is `text`:*
 1. Read the source file (handle encoding: try UTF-8, fall back to latin-1, then UTF-8 with replace).
-2. Detect complexity signals:
+2. If the content exceeds 500,000 bytes (UTF-8-encoded):
+   - Split into chunks of ≤500,000 bytes on line boundaries.
+   - Apply the text extraction rules above to each chunk separately (restore structure, convert tables to pipe format, remove repeated headers/footers/page numbers).
+   - Concatenate the reformatted chunks with a blank line between them. Go to step 4.
+3. Else, detect complexity signals:
    - Any line that starts with `|` (pipe table)
    - 3 or more lines containing two or more consecutive spaces mid-line
    - The same line (more than 10 characters) appearing verbatim 3 or more times
-3. If complex: rewrite as clean Markdown following the text extraction rules above.
-4. If not complex: use the content as-is without modification.
-5. Write to destination_path:
+   - If any signal present: apply the text extraction rules above to rewrite as clean Markdown.
+   - If no signal: use the content as-is without modification.
+4. Write to destination_path:
 ```
 ---
 source: <source_path>
@@ -134,6 +138,26 @@ ingest_id: <ingest_id value>
 ---
 
 <image analysis output>
+```
+
+*If category is `binary-doc`:*
+1. Run: `.venv/bin/python -m ingest_pipeline.extract_doc "<source_path>" --offset 0`
+   Quote the path to handle spaces and special characters in filenames.
+2. Parse the JSON from stdout. Note `has_more`.
+3. Apply the text extraction rules above to the `text` field to reformat it as clean Markdown — restore headings with `#`, convert aligned columns to pipe tables, remove repeated page artifacts (headers, footers, page numbers).
+4. If `has_more` is true, run again with `--offset 1`, apply the text extraction rules to that chunk, and continue incrementing the offset until `has_more` is false.
+5. Concatenate all reformatted chunks with a blank line between them.
+6. Any stderr output from the CLI is informational (e.g. image-only slides); log but do not fail.
+7. Write to destination_path:
+```
+---
+source: <source_path>
+category: binary-doc
+extracted_at: <ISO8601 now>
+ingest_id: <ingest_id value>
+---
+
+<concatenated reformatted text>
 ```
 
 Report back: a JSON list of `{"source_path": "...", "status": "extracted"|"failed", "error": null|"..."}` for each file.
@@ -282,6 +306,5 @@ After the index agent completes, update state.json: current_step 4, completed_st
 
 Print a summary:
 - Files extracted and summarized (counts by category)
-- Files skipped as `skipped-agent` (binary-docs list)
 - Any per-file errors reported by sub-agents
 - Steps completed

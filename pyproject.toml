@@ -18,6 +18,7 @@ dependencies = [
 ingest = "ingest_pipeline.cli:ingest"
 ingest-add = "ingest_pipeline.cli:ingest_add"
 ingest-amend = "ingest_pipeline.cli:ingest_amend"
+extract-doc = "ingest_pipeline.extract_doc:main"
 
 [build-system]
 requires = ["hatchling"]

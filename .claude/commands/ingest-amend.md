@@ -39,14 +39,12 @@ Orchestrate re-processing an amended source directory in parallel. You (Sonnet) 
 
 ## Phase 1 — Extract (parallel Haiku agents)
 
-Group all affected records with status `pending` and category `text` or `binary-image` into batches of at most 10. Spawn all Haiku extract agents **simultaneously** (model="haiku").
-
-For each binary-doc record in affected, mark it `skipped-agent` in the manifest.
+Group all affected records with status `pending` into batches of at most 10. Spawn all Haiku extract agents **simultaneously** (model="haiku").
 
 Template:
 
 ---
-You are an extraction sub-agent. Process each file below using your Read and Write tools.
+You are an extraction sub-agent. Process each file below using your Bash, Read, and Write tools.
 
 **Text extraction rules:**
 {{EXTRACT_TEXT_PROMPT}}
@@ -61,8 +59,14 @@ For each file, recompute the SHA-256 from current contents with `sha256sum`.
 
 *Text files:*
 1. Read source (try UTF-8, fall back to latin-1, then UTF-8 with replace).
-2. Check complexity: lines starting with `|`, 3+ lines with 2+ consecutive mid-line spaces, same line >10 chars 3+ times.
-3. If complex: rewrite as clean Markdown per the text extraction rules. If not: use as-is.
+2. If the content exceeds 500,000 bytes (UTF-8-encoded):
+   - Split into chunks of ≤500,000 bytes on line boundaries.
+   - Apply the text extraction rules above to each chunk separately (restore structure, convert tables to pipe format, remove repeated headers/footers/page numbers).
+   - Concatenate the reformatted chunks with a blank line between them. Go to step 4.
+3. Else, detect complexity signals:
+   - Any line that starts with `|`, 3+ lines with 2+ consecutive mid-line spaces, same line >10 chars 3+ times.
+   - If any signal present: apply the text extraction rules above to rewrite as clean Markdown.
+   - If no signal: use as-is.
 4. Write destination_path:
 ```
 ---
@@ -87,6 +91,26 @@ ingest_id: <fresh sha256 without prefix>
 ---
 
 <image analysis output>
+```
+
+*Binary-doc files:*
+1. Run: `.venv/bin/python -m ingest_pipeline.extract_doc "<source_path>" --offset 0`
+   Quote the path to handle spaces and special characters in filenames.
+2. Parse the JSON from stdout. Note `has_more`.
+3. Apply the text extraction rules above to the `text` field to reformat it as clean Markdown — restore headings with `#`, convert aligned columns to pipe tables, remove repeated page artifacts (headers, footers, page numbers).
+4. If `has_more` is true, run again with `--offset 1`, apply extraction rules to that chunk, and continue incrementing until `has_more` is false.
+5. Concatenate all reformatted chunks with a blank line between them.
+6. Any stderr output from the CLI is informational; log but do not fail.
+7. Write to destination_path:
+```
+---
+source: <source_path>
+category: binary-doc
+extracted_at: <ISO8601 now>
+ingest_id: <fresh sha256 without prefix>
+---
+
+<concatenated reformatted text>
 ```
 
 Report back: JSON list of `{"source_path": "...", "status": "extracted"|"failed", "error": null|"..."}`.
@@ -219,5 +243,4 @@ Update state.json: current_step 4, completed_steps [0,1,2,3,4].
 
 Print:
 - Files re-extracted and re-summarized (counts)
-- Files skipped as `skipped-agent` (binary-docs)
 - Any errors from sub-agents

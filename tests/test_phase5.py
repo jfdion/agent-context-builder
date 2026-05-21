@@ -468,8 +468,8 @@ class TestSlashCommands:
     def test_ingest_command_exists(self) -> None:
         cmd = COMMANDS_DIR / "ingest.md"
         content = cmd.read_text()
-        assert "!uv run ingest" in content
         assert "$ARGUMENTS" in content
+        assert "Phase 0" in content
 
     @pytest.mark.skipif(
         not (COMMANDS_DIR / "ingest-add.md").exists(),
@@ -478,8 +478,8 @@ class TestSlashCommands:
     def test_ingest_add_command_exists(self) -> None:
         cmd = COMMANDS_DIR / "ingest-add.md"
         content = cmd.read_text()
-        assert "!uv run ingest-add" in content
         assert "$ARGUMENTS" in content
+        assert "Phase 0" in content
 
     @pytest.mark.skipif(
         not (COMMANDS_DIR / "ingest-amend.md").exists(),
@@ -488,5 +488,5 @@ class TestSlashCommands:
     def test_ingest_amend_command_exists(self) -> None:
         cmd = COMMANDS_DIR / "ingest-amend.md"
         content = cmd.read_text()
-        assert "!uv run ingest-amend" in content
         assert "$ARGUMENTS" in content
+        assert "Phase 0" in content

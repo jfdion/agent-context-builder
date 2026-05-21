@@ -3,6 +3,7 @@ from pathlib import Path
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 SONNET_MODEL = "claude-sonnet-4-6"
 PIPELINE_VERSION = "1.0"
+CHUNK_SIZE_BYTES: int = 200_000
 
 MAX_TOKENS: dict[str, int] = {
     "extract": 4096,
