@@ -78,7 +78,7 @@ def build_manifest_files(
             continue
         stat = path.stat()
         mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
-        file_id = f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+        file_id = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
         dest = dest_path_for(path, source_root, dest_root)
         records.append(ManifestFile(
             id=file_id,

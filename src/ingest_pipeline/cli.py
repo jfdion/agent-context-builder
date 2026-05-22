@@ -21,10 +21,16 @@ from .pipeline import run_ingest, run_ingest_add, run_ingest_amend, PipelineErro
     type=int,
     help="Max binary file size in MB to process (0 = unlimited). Default: 50.",
 )
-def ingest(source: Path, destination: Path, rpm: int, prompts_dir: Path | None, max_binary_mb: int | None) -> None:
+@click.option(
+    "--locale",
+    default=None,
+    type=str,
+    help="Force locale for the knowledge base (e.g. 'en', 'fr', 'fr_CA'). Skips interactive detection.",
+)
+def ingest(source: Path, destination: Path, rpm: int, prompts_dir: Path | None, max_binary_mb: int | None, locale: str | None) -> None:
     """Ingest SOURCE directory into DESTINATION knowledge base."""
     try:
-        run_ingest(source, destination, rpm, prompts_dir, max_binary_mb=max_binary_mb)
+        run_ingest(source, destination, rpm, prompts_dir, max_binary_mb=max_binary_mb, locale=locale)
     except PipelineError as e:
         raise click.ClickException(str(e)) from e
 
@@ -45,10 +51,16 @@ def ingest(source: Path, destination: Path, rpm: int, prompts_dir: Path | None, 
     type=int,
     help="Max binary file size in MB to process (0 = unlimited). Default: 50.",
 )
-def ingest_add(source: Path, destination: Path, rpm: int, prompts_dir: Path | None, max_binary_mb: int | None) -> None:
+@click.option(
+    "--locale",
+    default=None,
+    type=str,
+    help="Force locale for the knowledge base (e.g. 'en', 'fr', 'fr_CA'). Skips interactive detection.",
+)
+def ingest_add(source: Path, destination: Path, rpm: int, prompts_dir: Path | None, max_binary_mb: int | None, locale: str | None) -> None:
     """Add new files from SOURCE to DESTINATION knowledge base."""
     try:
-        run_ingest_add(source, destination, rpm, prompts_dir, max_binary_mb=max_binary_mb)
+        run_ingest_add(source, destination, rpm, prompts_dir, max_binary_mb=max_binary_mb, locale=locale)
     except PipelineError as e:
         raise click.ClickException(str(e)) from e
 
@@ -69,9 +81,15 @@ def ingest_add(source: Path, destination: Path, rpm: int, prompts_dir: Path | No
     type=int,
     help="Max binary file size in MB to process (0 = unlimited). Default: 50.",
 )
-def ingest_amend(source: Path, destination: Path, rpm: int, prompts_dir: Path | None, max_binary_mb: int | None) -> None:
+@click.option(
+    "--locale",
+    default=None,
+    type=str,
+    help="Force locale for the knowledge base (e.g. 'en', 'fr', 'fr_CA'). Skips interactive detection.",
+)
+def ingest_amend(source: Path, destination: Path, rpm: int, prompts_dir: Path | None, max_binary_mb: int | None, locale: str | None) -> None:
     """Re-process amended files from SOURCE in DESTINATION knowledge base."""
     try:
-        run_ingest_amend(source, destination, rpm, prompts_dir, max_binary_mb=max_binary_mb)
+        run_ingest_amend(source, destination, rpm, prompts_dir, max_binary_mb=max_binary_mb, locale=locale)
     except PipelineError as e:
         raise click.ClickException(str(e)) from e

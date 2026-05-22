@@ -12,16 +12,62 @@ cd agent-context-builder
 uv sync
 ```
 
-An [Anthropic API key](https://console.anthropic.com/) is required for the Python CLI commands (`-api` suffix) but **not** for the Claude Code slash commands, which use your active Claude Code session instead.
+An [Anthropic API key](https://console.anthropic.com/) is required for the Python CLI commands (`uv run ingest …` and the `/…-api` slash commands) but **not** for the agent-orchestrated slash commands (`/ingest`, `/ingest-add`, `/ingest-amend`), which use your active Claude Code session instead.
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...   # required for uv run / /ingest-api commands only
+export ANTHROPIC_API_KEY=sk-ant-...   # required for uv run / /…-api commands only
 ```
+
+## Quick Start
+
+### 1. Make the tool available globally
+
+From the cloned repo, run the installer once:
+
+```bash
+./install.sh
+```
+
+This sets up everything Claude Code needs to run the pipeline from any directory:
+
+- runs `uv sync` if the local `.venv/` is missing;
+- symlinks `.claude/commands/` → `~/.claude/commands/` so the seven `/ingest*` slash commands are available in **every** Claude Code session;
+- symlinks `templates/CLAUDE-ingest-template.md` → `~/.claude/CLAUDE-ingest-template.md` (used by `/ingest-init`);
+- installs an `ingest-extract` wrapper at `~/.local/bin/ingest-extract` that runs the binary-doc extractor from anywhere. If `~/.local/bin` is not already on your `PATH`, the installer prints the line to add to your shell profile.
+
+To undo: remove `~/.claude/commands` and `~/.claude/CLAUDE-ingest-template.md` (both symlinks) and `~/.local/bin/ingest-extract`.
+
+### 2. Build a knowledge base from any directory
+
+Open Claude Code in the project you want to ingest and run:
+
+```text
+/ingest-init                            # create ./CLAUDE.md and ./context/
+/ingest ./src ./context                 # full pipeline (Sonnet + Haiku + Opus, no API key)
+```
+
+Or, with an API key, use the Python CLI:
+
+```bash
+/ingest-api ./src ./context             # same, from inside Claude Code
+uv run ingest ./src ./context           # same, from a regular shell (in the repo dir)
+```
+
+Add `--locale fr_CA` (or any BCP-47 tag) to force the synthesis language.
+
+### 3. Keep it up to date
+
+```text
+/ingest-add   ./src/new-module ./context     # new content
+/ingest-amend ./src/changed-dir ./context    # changed content (SHA-256 diff)
+```
+
+The same Python CLI equivalents — `/ingest-add-api`, `/ingest-amend-api`, `uv run ingest-add`, `uv run ingest-amend` — work identically.
 
 ## Suggested Workflow
 
 1. **Build the knowledge base** — run `ingest` on your source directory once. This produces `context/index.md` and all supporting files.
-2. **Point an agent at the context** — copy [`CLAUDE.md`](CLAUDE.md) into your target project. It instructs Claude to enter via `index.md`, read summaries before full extractions, and never read source or binary files directly. This keeps token usage low and answers fast.
+2. **Point an agent at the context** — copy [`CLAUDE.md`](CLAUDE.md) into your target project (or use `/ingest-init` to do it for you). It instructs Claude to enter via `index.md`, read summaries before full extractions, and never read source or binary files directly. This keeps token usage low and answers fast.
 3. **Keep it up to date** — when source files change, run `ingest-amend` on the affected subdirectory. When new content is added, use `ingest-add`.
 
 ## Pipeline Overview
@@ -29,28 +75,39 @@ export ANTHROPIC_API_KEY=sk-ant-...   # required for uv run / /ingest-api comman
 `ingest` runs a five-step map-reduce pipeline and writes a structured knowledge base to the destination directory. See [spec.md](spec.md) for the full specification.
 
 ```
-source/          →      context/
+source/                 context/
 ├── docs/               ├── docs/
-│   ├── spec.pdf        │   ├── spec.md          ← extracted text
+│   ├── spec.pdf        │   ├── spec.md            ← extracted text
 │   └── arch.png        │   ├── arch.md
-│                       │   ├── _summary_spec.md ← per-file summary
-│                       │   ├── _summary_arch.md
-│                       │   └── _reduce_docs.md  ← directory roll-up
-└── README.md           ├── README.md
-                        └── index.md             ← top-level entry point
+│                       │   ├── _summary_spec.md   ← per-file summary
+└── README.md           │   └── _summary_arch.md
+                        ├── README.md
+                        ├── _summary_README.md
+                        ├── _reduce_docs.md        ← roll-up for docs/ (one level above)
+                        ├── _reduce_root.md        ← roll-up for context/ itself
+                        ├── index.md               ← top-level entry point
+                        └── .ingest/               ← manifest, state, journal
 ```
 
-| Step | Name | What happens |
-|------|------|--------------|
-| 0 | **Walk** | Scans source, mirrors directory tree, builds a manifest with SHA-256 fingerprints for each file. |
-| 1 | **Extract** | Converts each file to Markdown. Text files are read directly; PDFs/DOCX/PPTX/XLSX are parsed with their respective libraries; images are described via Claude vision. |
-| 2 | **Summarize** | Generates a concise `_summary_<name>.md` for every extracted file. |
-| 3 | **Reduce** | Bottom-up roll-up: for each directory, combines its summaries into a single `_reduce_<dir>.md`, then propagates upward to the root. |
-| 4 | **Index** | Writes `index.md` — the canonical entry point for the knowledge base — covering directory structure, key concepts, and file purposes. |
+`_reduce_<dir>.md` files are placed **one level above** the directory they summarize, alongside sibling reduce files. The root roll-up is named `_reduce_root.md`.
 
-**Supported file types:** `.txt`, `.md`, `.csv`, `.json`, `.yaml`, `.py`, `.js`, `.ts`, `.go`, `.rs`, `.java`, `.cs`, `.sql`, `.html`, `.xml`, `.sh` and other text formats; `.pdf`, `.docx`, `.pptx`, `.xlsx`; `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`.
+| Step | Name | Model (slash commands) | What happens |
+|------|------|------------------------|--------------|
+| 0 | **Walk** | Sonnet (orchestrator) | Scans source, mirrors directory tree, builds a manifest with SHA-256 content hashes for each file. |
+| 1 | **Extract** | Haiku (parallel agents) | Converts each file to Markdown. Text files are read directly; PDFs/DOCX/PPTX/XLSX are parsed with their respective libraries; images are described via Claude vision. |
+| 2 | **Summarize** | Haiku (parallel agents) | Generates a concise `_summary_<name>.md` for every extracted file. |
+| 3 | **Reduce** | Haiku (parallel agents) | Bottom-up roll-up: for each directory, combines its summaries into a single `_reduce_<dir>.md`, then propagates upward to the root. |
+| 4 | **Index** | Opus (single agent) | Writes `index.md` — the canonical entry point for the knowledge base — covering directory structure, key concepts, and file purposes. |
 
-**Resumability:** if a run is interrupted, re-running `ingest-api` on the same destination will offer to resume from the last completed step.
+**Supported file types** (extensions can be tuned in `src/ingest_pipeline/config.py`):
+
+- **Text** — `.txt`, `.md`, `.rst`, `.csv`, `.json`, `.yaml`, `.yml`, `.xml`, `.html`, `.svg`, `.toml`, `.ini`, `.cfg`, `.sql`, `.sh`, `.bash`, `.zsh`, `.py`, `.js`, `.ts`, `.java`, `.cs`, `.kt`, `.swift`, `.go`, `.rb`, `.rs`, `.c`, `.h`, `.cpp`, `.hpp`
+- **Binary documents** — `.pdf`, `.docx`, `.pptx`, `.xlsx`
+- **Images** — `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`
+
+Files matching `SKIP_NAMES` (`.DS_Store`, `.gitignore`, `.gitkeep`), `SKIP_SUFFIXES` (`.lock`, `.pyc`), or living under `SKIP_DIRS` (`node_modules`, `.git`, `__pycache__`, `.ingest`, `.venv`, `venv`, `.tox`, `dist`, `build`, `.mypy_cache`) are pruned during the walk.
+
+**Resumability:** if a run is interrupted, re-running `uv run ingest` on the same destination offers to resume from the last completed step. Files with `status: "completed"` in the manifest are skipped; only `pending`, `extracted`, and `failed` files are re-processed.
 
 ### Commands
 
@@ -60,13 +117,13 @@ There are two ways to run the pipeline: the **Python CLI** (requires `ANTHROPIC_
 
 ```bash
 # Full ingest (with resume support)
-uv run ingest <source> <destination> [--rpm 60] [--max-binary-mb 50]
+uv run ingest <source> <destination> [--rpm 60] [--max-binary-mb 50] [--locale fr_CA]
 
 # Add a new subdirectory to an existing knowledge base
-uv run ingest-add <source-subdir> <destination>
+uv run ingest-add <source-subdir> <destination> [--locale fr_CA]
 
 # Re-process files in a subdirectory that have changed
-uv run ingest-amend <source-subdir> <destination>
+uv run ingest-amend <source-subdir> <destination> [--locale fr_CA]
 ```
 
 #### Claude Code slash commands
@@ -78,9 +135,9 @@ Six commands are available from within a Claude Code session in this repo:
 | `/ingest <source> <destination>` | Agent (parallel) | Full pipeline — Sonnet orchestrates, Haiku processes files in parallel, Opus builds the index |
 | `/ingest-add <source-subdir> <destination>` | Agent (parallel) | Add a new subdirectory, re-reduce and re-index |
 | `/ingest-amend <source-subdir> <destination>` | Agent (parallel) | Reset and re-process a subdirectory, re-reduce and re-index |
-| `/ingest-api <source> <destination> [--rpm INT] [--max-binary-mb INT]` | Python CLI | Same as `uv run ingest`; requires `ANTHROPIC_API_KEY` |
-| `/ingest-add-api <source-subdir> <destination> [--rpm INT] [--max-binary-mb INT]` | Python CLI | Same as `uv run ingest-add`; requires `ANTHROPIC_API_KEY` |
-| `/ingest-amend-api <source-subdir> <destination> [--rpm INT] [--max-binary-mb INT]` | Python CLI | Same as `uv run ingest-amend`; requires `ANTHROPIC_API_KEY` |
+| `/ingest-api <source> <destination> [--rpm INT] [--max-binary-mb INT] [--locale LOCALE]` | Python CLI | Same as `uv run ingest`; requires `ANTHROPIC_API_KEY` |
+| `/ingest-add-api <source-subdir> <destination> [--rpm INT] [--max-binary-mb INT] [--locale LOCALE]` | Python CLI | Same as `uv run ingest-add`; requires `ANTHROPIC_API_KEY` |
+| `/ingest-amend-api <source-subdir> <destination> [--rpm INT] [--max-binary-mb INT] [--locale LOCALE]` | Python CLI | Same as `uv run ingest-amend`; requires `ANTHROPIC_API_KEY` |
 
 The agent commands (`/ingest`, `/ingest-add`, `/ingest-amend`) use a multi-agent architecture:
 
@@ -107,3 +164,25 @@ uv run ingest <source> <destination> --prompts-dir ./my-prompts
 | `index.txt` | 4 | Top-level knowledge base index |
 
 Copy the built-in `prompts/` directory as a starting point and edit as needed.
+
+### Locale support
+
+The pipeline detects the language of each source file at extraction time and records it in the `locale:` field of the resulting extract, summary, and reduce front matter. The reduce step is also told which language to synthesize in, so a French source tree produces French summaries and roll-ups.
+
+**Auto-detection (default).** During Step 1, `detect_locale()` scores each extracted text against built-in stopword sets (currently French and English) and writes one of `fr`, `en`, or `und` into the file's front matter. Between Steps 2 and 3 the pipeline tallies per-file locales:
+
+- All files agree on one locale → it is used for the run automatically.
+- Multiple locales are detected → you are prompted interactively to pick one.
+- No locale could be determined → `"und"` is used.
+
+**Forcing a locale.** Pass `--locale` with a BCP-47 tag to skip detection and the interactive prompt entirely:
+
+```bash
+uv run ingest <source> <destination> --locale fr
+uv run ingest <source> <destination> --locale fr_CA
+uv run ingest-add <source-subdir> <destination> --locale en
+```
+
+The same flag is available on all three CLI commands and their `/…-api` Claude Code equivalents (e.g. `/ingest-api <source> <destination> --locale fr_CA`).
+
+See [spec.md § Locale Handling](spec.md) for the full resolution order and how each step consumes the locale.

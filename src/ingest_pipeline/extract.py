@@ -13,6 +13,40 @@ from .config import CHUNK_SIZE_BYTES, HAIKU_MODEL, MAX_TOKENS
 from .api import call_claude, call_claude_vision
 from .state import ManifestFile, State, append_journal, journal_event
 
+_FR_WORDS: frozenset[str] = frozenset({
+    "les", "des", "est", "une", "qui", "que", "dans", "sur", "pour", "avec",
+    "pas", "au", "aux", "par", "ce", "je", "tu", "il", "nous", "vous", "ils",
+    "mais", "ou", "et", "donc", "or", "ni", "car", "du", "de", "la", "le",
+    "en", "un", "plus", "bien", "tout", "même", "très", "aussi", "comme",
+    "être", "avoir", "faire", "cette", "leur", "leurs", "dont", "dont",
+})
+
+_EN_WORDS: frozenset[str] = frozenset({
+    "the", "and", "for", "that", "this", "with", "from", "are", "have", "not",
+    "you", "all", "can", "its", "your", "our", "they", "was", "will", "been",
+    "has", "had", "would", "about", "which", "their", "when", "there", "also",
+    "into", "more", "some", "than", "then", "time", "what", "said", "each",
+    "other", "just", "know", "take", "only", "come", "most", "over", "such",
+})
+
+
+def detect_locale(text: str) -> str:
+    """Detect dominant language (fr/en/und) from text using stopword frequency."""
+    words = {w.lower() for w in text.split() if w.isalpha() and len(w) > 1}
+    fr_score = len(words & _FR_WORDS)
+    en_score = len(words & _EN_WORDS)
+    if fr_score == 0 and en_score == 0:
+        return "und"
+    return "fr" if fr_score > en_score else "en"
+
+
+def _rel(path: str) -> str:
+    """Return path relative to CWD; fall back to original if not relative."""
+    try:
+        return str(Path(path).relative_to(Path.cwd()))
+    except ValueError:
+        return path
+
 
 def _chunk_text(text: str, chunk_size: int) -> list[str]:
     """Split text into chunks of at most chunk_size bytes on line boundaries."""
@@ -54,17 +88,20 @@ def has_complexity_signals(text: str) -> bool:
     return False
 
 
-def _build_front_matter(record: ManifestFile, source_path: Path) -> str:
+def _build_front_matter(record: ManifestFile, source_path: Path, locale: str = "und") -> str:
     ingest_id = record.id.removeprefix("sha256:")
     extracted_at = datetime.now(timezone.utc).isoformat()
-    return (
-        f"---\n"
-        f"source: {record.source_path}\n"
-        f"category: {record.category}\n"
-        f"extracted_at: {extracted_at}\n"
-        f"ingest_id: {ingest_id}\n"
-        f"---\n\n"
-    )
+    return "\n".join([
+        "---",
+        "source: " + _rel(record.source_path),
+        "category: " + record.category,
+        "locale: " + locale,
+        "extracted_at: " + extracted_at,
+        "ingest_id: " + ingest_id,
+        "---",
+        "",
+        "",
+    ])
 
 
 def extract_text_file(
@@ -85,13 +122,11 @@ def extract_text_file(
         except UnicodeDecodeError:
             raw_text = source_path.read_text(encoding="utf-8", errors="replace")
 
-    front_matter = _build_front_matter(record, source_path)
-
     if len(raw_text.encode("utf-8")) > 500_000:
         chunks = _chunk_text(raw_text, 500_000)
         processed_parts = []
         for chunk in chunks:
-            user_content = f"Source: {record.source_path}\n\nContent:\n{chunk}"
+            user_content = "Source: " + record.source_path + "\n\nContent:\n" + chunk
             processed_parts.append(call_claude(
                 client,
                 HAIKU_MODEL,
@@ -105,7 +140,7 @@ def extract_text_file(
 
         content = "\n\n".join(processed_parts)
     elif has_complexity_signals(raw_text):
-        user_content = f"Source: {record.source_path}\n\nContent:\n{raw_text}"
+        user_content = "Source: " + record.source_path + "\n\nContent:\n" + raw_text
         content = call_claude(
             client,
             HAIKU_MODEL,
@@ -119,6 +154,8 @@ def extract_text_file(
     else:
         content = raw_text
 
+    locale = detect_locale(raw_text)
+    front_matter = _build_front_matter(record, source_path, locale)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     dest_path.write_text(front_matter + content, encoding="utf-8")
 
@@ -201,7 +238,7 @@ def extract_pptx(source_path: Path, warnings: list[dict]) -> str:
         # Build slide content
         slide_content = "\n\n".join(slide_text_parts)
         if notes_text:
-            slide_content += f"\n\n## Speaker Notes\n{notes_text}"
+            slide_content += "\n\n## Speaker Notes\n" + notes_text
 
         slides_text.append(slide_content)
 
@@ -222,7 +259,7 @@ def extract_xlsx(source_path: Path) -> str:
             continue
 
         # Build markdown table
-        table_lines = [f"## {sheet_name}", ""]
+        table_lines = ["## " + sheet_name, ""]
 
         # Convert rows to strings, handling None values
         for row in rows:
@@ -264,17 +301,14 @@ def extract_binary_doc(
     elif suffix == ".xlsx":
         raw_text = extract_xlsx(source_path)
     else:
-        raise ValueError(f"Unsupported binary document format: {suffix}")
-
-    # Build front matter
-    front_matter = _build_front_matter(record, source_path)
+        raise ValueError("Unsupported binary document format: " + suffix)
 
     # For PDF, handle chunking if text > CHUNK_SIZE_BYTES
     if suffix == ".pdf" and len(raw_text.encode("utf-8")) > CHUNK_SIZE_BYTES:
         chunks = _chunk_text(raw_text, CHUNK_SIZE_BYTES)
         processed_parts = []
         for chunk in chunks:
-            user_content = f"Source: {record.source_path}\n\nContent:\n{chunk}"
+            user_content = "Source: " + record.source_path + "\n\nContent:\n" + chunk
             content = call_claude(
                 client,
                 HAIKU_MODEL,
@@ -290,7 +324,7 @@ def extract_binary_doc(
         final_content = "\n\n".join(processed_parts)
     else:
         # Always call Claude for binary docs
-        user_content = f"Source: {record.source_path}\n\nContent:\n{raw_text}"
+        user_content = "Source: " + record.source_path + "\n\nContent:\n" + raw_text
         final_content = call_claude(
             client,
             HAIKU_MODEL,
@@ -302,7 +336,8 @@ def extract_binary_doc(
             dest_root,
         )
 
-    # Write output
+    locale = detect_locale(raw_text)
+    front_matter = _build_front_matter(record, source_path, locale)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     dest_path.write_text(front_matter + final_content, encoding="utf-8")
 
@@ -336,7 +371,7 @@ def extract_image(
         prompts["extract_image"],
         image_data,
         media_type,
-        f"Source: {record.source_path}",
+        "Source: " + record.source_path,
         MAX_TOKENS["image"],
         rpm,
         state,
@@ -364,7 +399,7 @@ def extract_file(
     elif record.category == "binary-image":
         extract_image(source_path, dest_path, record, prompts, client, rpm, state, dest_root)
     else:
-        raise ValueError(f"Unknown category: {record.category}")
+        raise ValueError("Unknown category: " + record.category)
 
 
 def run_extract_step(
@@ -407,10 +442,10 @@ def run_extract_step(
             state.completed_files.append(record.source_path)
         except NotImplementedError as e:
             record.status = "skipped"
-            errors.append(f"{record.source_path}: {e}")
+            errors.append(str(record.source_path) + ": " + str(e))
         except Exception as e:
             record.status = "failed"
             state.failed_files.append(record.source_path)
-            errors.append(f"{record.source_path}: {e}")
+            errors.append(str(record.source_path) + ": " + str(e))
             append_journal(dest_root, journal_event("file_error", file=record.source_path, error=str(e), cmd=state.command))
     return errors

@@ -9,8 +9,28 @@ from .api import call_claude
 from .state import ManifestFile, State, append_journal, journal_event
 
 
+def _rel(path: str) -> str:
+    try:
+        return str(Path(path).relative_to(Path.cwd()))
+    except ValueError:
+        return path
+
+
+def _extract_locale(text: str) -> str:
+    """Read locale from a file's YAML front matter; return 'und' if absent."""
+    if not text.startswith("---\n"):
+        return "und"
+    end_idx = text.find("\n---\n", 4)
+    if end_idx == -1:
+        return "und"
+    for line in text[4:end_idx].splitlines():
+        if line.startswith("locale:"):
+            return line.split(":", 1)[1].strip()
+    return "und"
+
+
 def _summary_path(dest_path: Path) -> Path:
-    return dest_path.parent / f"_summary_{dest_path.stem}.md"
+    return dest_path.parent / ("_summary_" + dest_path.stem + ".md")
 
 
 def _extract_tags(text: str) -> list[str]:
@@ -25,19 +45,22 @@ def _extract_tags(text: str) -> list[str]:
     return tags
 
 
-def _build_front_matter(source_summary: str, tags: list[str], summarized_at: str) -> str:
+def _build_front_matter(source_summary: str, tags: list[str], summarized_at: str, locale: str = "und") -> str:
     if tags:
-        tags_block = "tags:\n" + "\n".join(f"  - {t}" for t in tags)
+        tags_block = "tags:\n" + "\n".join("  - " + t for t in tags)
     else:
         tags_block = "tags: []"
-    return (
-        f"---\n"
-        f"type: summary\n"
-        f"source_summary: {source_summary}\n"
-        f"{tags_block}\n"
-        f"summarized_at: {summarized_at}\n"
-        f"---\n\n"
-    )
+    return "\n".join([
+        "---",
+        "type: summary",
+        "source_summary: " + _rel(source_summary),
+        "locale: " + locale,
+        tags_block,
+        "summarized_at: " + summarized_at,
+        "---",
+        "",
+        "",
+    ])
 
 
 def summarize_file(
@@ -55,7 +78,7 @@ def summarize_file(
         return
 
     extracted_text = dest_path.read_text(encoding="utf-8")
-    user_content = f"Source: {record.source_path}\n\nExtracted content:\n{extracted_text}"
+    user_content = "Source: " + record.source_path + "\n\nExtracted content:\n" + extracted_text
 
     try:
         summary = call_claude(
@@ -73,8 +96,9 @@ def summarize_file(
         raise
 
     tags = _extract_tags(summary)
+    locale = _extract_locale(extracted_text)
     summarized_at = datetime.now(timezone.utc).isoformat()
-    front_matter = _build_front_matter(record.source_path, tags, summarized_at)
+    front_matter = _build_front_matter(record.source_path, tags, summarized_at, locale)
     summary_path.write_text(front_matter + summary, encoding="utf-8")
 
 
@@ -94,5 +118,5 @@ def run_summarize_step(
         try:
             summarize_file(record, prompts, client, rpm, state, dest_root)
         except Exception as e:
-            errors.append(f"{record.source_path}: {e}")
+            errors.append(str(record.source_path) + ": " + str(e))
     return errors

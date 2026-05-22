@@ -824,3 +824,144 @@ class TestIndexNonProcessedDocuments:
         assert "### Oversized Files" in index_content
         # But no symlinks section since journal is absent
         assert "### Symbolic Links" not in index_content
+
+
+# =====================================================================
+# Content-hash skip in ingest-amend
+# =====================================================================
+
+class TestAmendContentHashSkip:
+
+    def test_unchanged_file_not_deleted(self, tmp_path: Path, prompts_dir: Path) -> None:
+        """When a file's content matches the stored hash, its output is preserved."""
+        import hashlib
+
+        source_root = tmp_path / "source"
+        module_a = source_root / "moduleA"
+        module_a.mkdir(parents=True)
+        foo_src = module_a / "foo.py"
+        content = b"def foo(): pass"
+        foo_src.write_bytes(content)
+        real_hash = f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+        dest = tmp_path / "dest"
+        dest_module_a = dest / "moduleA"
+        dest_module_a.mkdir(parents=True)
+
+        foo_dest = dest_module_a / "foo.md"
+        foo_dest.write_text("preserved extracted content", encoding="utf-8")
+        (dest_module_a / "_summary_foo.md").write_text(SUMMARY_CONTENT, encoding="utf-8")
+
+        record = ManifestFile(
+            id=real_hash,  # matches actual file content
+            source_path=str(foo_src),
+            destination_path=str(foo_dest),
+            category="text",
+            size_bytes=foo_src.stat().st_size,
+            mtime="2026-01-01T00:00:00+00:00",
+            status="extracted",
+        )
+        _setup_dest(dest, source_root, [record])
+
+        tracked_deletions = []
+        original_unlink = Path.unlink
+
+        def tracking_unlink(self, *args, **kwargs):
+            tracked_deletions.append(self.name)
+            return original_unlink(self, *args, **kwargs)
+
+        with (
+            patch("ingest_pipeline.pipeline.anthropic.Anthropic", return_value=_mock_client()),
+            patch("ingest_pipeline.api.time.sleep"),
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+            patch.object(Path, "unlink", tracking_unlink),
+        ):
+            run_ingest_amend(module_a, dest, rpm=60, prompts_dir=prompts_dir)
+
+        # foo.md should NOT have been deleted since hash matches
+        assert "foo.md" not in tracked_deletions
+        assert "foo.py content preserved extracted content" not in tracked_deletions
+
+    def test_journal_contains_file_unchanged_event(self, tmp_path: Path, prompts_dir: Path) -> None:
+        """When a file is unchanged, a file_unchanged journal event is written."""
+        import hashlib
+
+        source_root = tmp_path / "source"
+        module_a = source_root / "moduleA"
+        module_a.mkdir(parents=True)
+        foo_src = module_a / "foo.py"
+        content = b"def foo(): pass"
+        foo_src.write_bytes(content)
+        real_hash = f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+        dest = tmp_path / "dest"
+        dest_module_a = dest / "moduleA"
+        dest_module_a.mkdir(parents=True)
+
+        foo_dest = dest_module_a / "foo.md"
+        foo_dest.write_text("extracted content", encoding="utf-8")
+        (dest_module_a / "_summary_foo.md").write_text(SUMMARY_CONTENT, encoding="utf-8")
+
+        record = ManifestFile(
+            id=real_hash,
+            source_path=str(foo_src),
+            destination_path=str(foo_dest),
+            category="text",
+            size_bytes=foo_src.stat().st_size,
+            mtime="2026-01-01T00:00:00+00:00",
+            status="extracted",
+        )
+        _setup_dest(dest, source_root, [record])
+
+        with (
+            patch("ingest_pipeline.pipeline.anthropic.Anthropic", return_value=_mock_client()),
+            patch("ingest_pipeline.api.time.sleep"),
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+        ):
+            run_ingest_amend(module_a, dest, rpm=60, prompts_dir=prompts_dir)
+
+        events = [json.loads(line) for line in (ingest_dir(dest) / "journal.jsonl").read_text().splitlines()]
+        assert any(e["event"] == "file_unchanged" for e in events)
+
+    def test_changed_file_reprocessed(self, tmp_path: Path, prompts_dir: Path) -> None:
+        """When a file content has changed (hash mismatch), it is reprocessed."""
+        source_root = tmp_path / "source"
+        module_a = source_root / "moduleA"
+        module_a.mkdir(parents=True)
+        foo_src = module_a / "foo.py"
+        foo_src.write_text("def foo(): pass", encoding="utf-8")
+
+        dest = tmp_path / "dest"
+        dest_module_a = dest / "moduleA"
+        dest_module_a.mkdir(parents=True)
+
+        foo_dest = dest_module_a / "foo.md"
+        foo_dest.write_text("old content", encoding="utf-8")
+
+        record = ManifestFile(
+            id="sha256:stale_hash",  # deliberately wrong hash
+            source_path=str(foo_src),
+            destination_path=str(foo_dest),
+            category="text",
+            size_bytes=foo_src.stat().st_size,
+            mtime="2026-01-01T00:00:00+00:00",
+            status="extracted",
+        )
+        _setup_dest(dest, source_root, [record])
+
+        tracked_deletions = []
+        original_unlink = Path.unlink
+
+        def tracking_unlink(self, *args, **kwargs):
+            tracked_deletions.append(self.name)
+            return original_unlink(self, *args, **kwargs)
+
+        with (
+            patch("ingest_pipeline.pipeline.anthropic.Anthropic", return_value=_mock_client()),
+            patch("ingest_pipeline.api.time.sleep"),
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+            patch.object(Path, "unlink", tracking_unlink),
+        ):
+            run_ingest_amend(module_a, dest, rpm=60, prompts_dir=prompts_dir)
+
+        assert "foo.md" in tracked_deletions

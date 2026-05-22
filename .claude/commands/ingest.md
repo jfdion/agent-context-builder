@@ -1,6 +1,6 @@
 Orchestrate the full ingest pipeline in parallel. You (Sonnet) orchestrate; Haiku sub-agents process files; Opus builds the index.
 
-**Arguments:** $ARGUMENTS — parse SOURCE (first arg) and DESTINATION (second arg), resolve both to absolute paths.
+**Arguments:** $ARGUMENTS — parse SOURCE (first arg) and DESTINATION (second arg), resolve both to absolute paths. Optional: `--locale LOCALE` (e.g. `fr`, `fr_CA`) — if provided, skip interactive locale detection and use this value for all front matter and reduce/index steps.
 
 ---
 

@@ -41,6 +41,7 @@ class State:
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     max_binary_mb: int = 50
+    locale: str = "und"
 
 
 def ingest_dir(dest_root: Path) -> Path:

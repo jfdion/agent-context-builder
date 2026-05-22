@@ -67,12 +67,12 @@ All control flow is deterministic Python. Claude API calls are content-only oper
 ### Installation
 
 ```
-uv run ingest <source> <destination>
-uv run ingest-add <source>
-uv run ingest-amend <source>
+uv run ingest <source> <destination> [--rpm INT] [--max-binary-mb INT] [--locale LOCALE] [--prompts-dir PATH]
+uv run ingest-add <source-subdir> <destination> [--rpm INT] [--max-binary-mb INT] [--locale LOCALE] [--prompts-dir PATH]
+uv run ingest-amend <source-subdir> <destination> [--rpm INT] [--max-binary-mb INT] [--locale LOCALE] [--prompts-dir PATH]
 ```
 
-Defined via `[project.scripts]` in `pyproject.toml`. Each command maps to a Click entry point in the package.
+Defined via `[project.scripts]` in `pyproject.toml`. Each command maps to a Click entry point in `cli.py`. `ingest-add` and `ingest-amend` both require an explicit `destination` — they do **not** derive it from a single positional argument.
 
 ### Claude Code slash commands
 
@@ -129,10 +129,14 @@ Symlinks encountered during the walk are excluded from the manifest, logged as `
 
 | Category | Extensions | Handler |
 |----------|-----------|---------|
-| `text` | `.txt`, `.md`, `.csv`, `.json`, `.yaml`, `.yml`, `.xml`, `.html`, `.java`, `.py`, `.js`, `.ts`, `.sql`, `.rst`, `.svg` | Text extraction |
+| `text` | `.txt`, `.md`, `.csv`, `.json`, `.yaml`, `.yml`, `.xml`, `.html`, `.java`, `.py`, `.js`, `.ts`, `.sql`, `.rst`, `.toml`, `.ini`, `.cfg`, `.sh`, `.bash`, `.zsh`, `.go`, `.rb`, `.rs`, `.c`, `.h`, `.cpp`, `.hpp`, `.cs`, `.kt`, `.swift`, `.svg` | Text extraction |
 | `binary-doc` | `.pdf`, `.docx`, `.pptx`, `.xlsx` | OCR/parse extraction |
 | `binary-image` | `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp` | Visual analysis |
-| `skip` | `.DS_Store`, `.gitignore`, `*.lock`, `node_modules/**` | Ignored |
+| `skip` (names) | `.DS_Store`, `.gitignore`, `.gitkeep` | Ignored |
+| `skip` (suffixes) | `*.lock`, `*.pyc` | Ignored |
+| `skip` (dirs) | `node_modules`, `.git`, `__pycache__`, `.ingest`, `.venv`, `venv`, `.tox`, `dist`, `build`, `.mypy_cache` | Pruned during walk |
+
+The authoritative lists live in `config.py` as `TEXT_EXTENSIONS`, `BINARY_DOC_EXTENSIONS`, `BINARY_IMAGE_EXTENSIONS`, `SKIP_NAMES`, `SKIP_SUFFIXES`, and `SKIP_DIRS`.
 
 SVG is classified as `text` (it is XML); it is copied verbatim without an API call unless complexity signals are detected.
 
@@ -160,10 +164,7 @@ Binary files (`binary-doc`, `binary-image`) larger than `--max-binary-mb` (defau
 }
 ```
 
-Valid `status` values: `"pending"` (not yet processed), `"completed"` (output written successfully), `"failed"` (error during processing, see `state.json.failed_files`), `"skipped-oversized"` (binary file exceeded `--max-binary-mb`).
-
-```json
-```
+Valid `status` values: `"pending"` (not yet processed), `"extracted"` (Step 1 complete, awaiting summarize), `"completed"` (summary written successfully), `"failed"` (error during processing, see `state.json.failed_files`), `"skipped-oversized"` (binary file exceeded `--max-binary-mb`).
 
 ---
 
@@ -244,40 +245,48 @@ Every extracted `.md` file starts with:
 ---
 source: {source_path}
 category: {category}
+locale: {bcp47-or-und}
 extracted_at: {ISO8601}
 ingest_id: {sha256}
 ---
 ```
 
+The `locale` field is set by `detect_locale()` in `extract.py` (stopword-frequency comparison; currently distinguishes `fr`, `en`, or `und`). See § "Locale Handling" below.
+
 ---
 
 ## Step 2 — Summary (Map)
 
-**Input:** one extracted `.md` file  
+**Input:** one extracted `.md` file
 **Output:** `_summary_{stem}.md` in same directory as the extracted file
 
-Processed bottom-up: deepest directory level first.
+Files are processed in manifest insertion order (not bottom-up). Step 3 is the bottom-up phase.
 
-Prompt contract:
+The model receives `prompts/summarize.txt` and is instructed to return prose + a `## Key Topics` bullet list with **no front matter** (the pipeline prepends it). The summary is written in the dominant language of the extracted content.
 
-```
-Given the following extracted document, produce a summary.
-Rules:
-- Preserve all essential facts, definitions, rules, and relationships.
-- Length: 10–20% of source, minimum 3 sentences.
-- Produce a tags list: 5–15 lowercase keywords covering theme, domain, and scope.
-- The summary must reference the source file as the source of truth.
+Tags are parsed from the `## Key Topics` block by `reduce._extract_tags()` after the call returns. The `locale` is carried over from the extract file's front matter via `_extract_locale()`.
 
-Output format exactly:
+Output file format (front matter prepended by `summarize._build_front_matter`, body returned by the model):
+
+```markdown
 ---
+type: summary
 source_summary: {extracted_md_path}
-tags: [tag1, tag2, ...]
+locale: {bcp47-or-und}
+tags:
+  - {tag1}
+  - {tag2}
 summarized_at: {ISO8601}
 ---
 
-## Summary
-{summary text}
+{prose summary, 3–8 sentences}
+
+## Key Topics
+- {topic 1}
+- {topic 2}
 ```
+
+If no `## Key Topics` block is detected the front matter records `tags: []`.
 
 ---
 
@@ -304,74 +313,75 @@ moduleB/_summary_*.md  →  _reduce_moduleB.md  (at context root)
 _reduce_moduleA.md + _reduce_moduleB.md  →  _reduce_root.md  (at context root)
 ```
 
-Prompt contract:
+The model receives `prompts/reduce.txt` plus an input block containing every `_summary_*.md` and child `_reduce_*.md` file in the directory, prefixed with a `Language:` line set by `_dominant_locale()` (most-frequent non-`und` locale across the inputs). The model returns prose + `## Components` + `## Key Topics` with **no front matter**.
 
-```
-Synthesize the following summaries into a single directory-level summary.
-Rules:
-- Identify cross-cutting themes and relationships between documents.
-- Mention each summarized file by name with a relative markdown link.
-- Produce a merged tags list (union, deduplicated, sorted).
-- Do not repeat information already captured at the sub-summary level verbatim; synthesize.
+Tags in the front matter are the union (insertion-order, deduplicated) of all `tags:` blocks across the input files, computed in Python by `_parse_front_matter_tags()`.
 
-Output format exactly:
+Output file format (front matter prepended by `reduce._build_reduce_front_matter`, body returned by the model):
+
+```markdown
 ---
 type: reduce
-directory: {dir_name}
+directory: {rel_dir_path}
+locale: {bcp47-or-und}
 sources:
-  - {relative_path_to_summary_1}
-  - {relative_path_to_summary_2}
-tags: [tag1, tag2, ...]
+  - {relative_path_to_input_1}
+  - {relative_path_to_input_2}
+tags:
+  - {tag1}
+  - {tag2}
 reduced_at: {ISO8601}
 ---
 
-## Directory Summary: {dir_name}
-{synthesis text}
+{prose synthesis, 4–10 sentences}
 
-## Contents
-| File | Tags |
-|------|------|
-| [_summary_doc1.md]({rel_path}) | tag1, tag2 |
+## Components
+- {file or subdir}: {one-line description}
+
+## Key Topics
+- {topic 1}
+- {topic 2}
 ```
 
 ---
 
 ## Step 4 — Index
 
-**Input:** all first-level `_reduce_*.md` files + `_reduce_root.md`  
+**Input:** all top-level `_reduce_*.md` files at `<destination>` root (including `_reduce_root.md`)
 **Output:** `index.md` at `<destination>` root
 
-Prompt contract:
+The model receives `prompts/index.txt` plus the concatenated content of every top-level reduce file. It returns prose only — front matter is prepended by `index.run_index_step`. After the model returns, `_build_non_processed_section()` appends a `## Non-Processed Documents` section listing any files whose manifest status is `skipped-oversized` or `failed`; if no such files exist the section is omitted.
 
+Output file format:
+
+```markdown
+---
+type: index
+generated_at: {ISO8601}
+---
+
+## Overview
+{4–8 sentences describing the knowledge base}
+
+## Directory Structure
+- {top-level dir}: {one-line description}
+
+## Key Concepts
+- {concept 1}
+- {concept 2}
+
+## Quick Reference
+| File | Path | Purpose |
+|------|------|---------|
+| ... | ... | ... |
+
+## Non-Processed Documents   ← appended by Python only if any exist
+| File | Reason | Size |
+|------|--------|------|
+| ... | oversized | 84.2 MB |
 ```
-Given the root-level reduce file and all first-level directory reduce files, produce a knowledge base index.
-Rules:
-- Group content by theme, not by directory structure (themes emerge from tags).
-- Each theme entry links to the most relevant reduce or summary file.
-- Include a directory tree overview section.
-- Remain factual; no editorial commentary.
 
-Output format exactly:
-# Knowledge Base Index
-
-Generated: {ISO8601}
-Source root: {source_root}
-
-## Directory Overview
-{ASCII tree of /context with one-line description per node}
-
-## Thematic Index
-### {Theme 1}
-- [{descriptor}]({path}) — {one sentence}
-
-### {Theme 2}
-...
-
-## Top-Level References
-| Directory | Reduce File | Primary Tags |
-|-----------|-------------|--------------|
-| moduleA | [_reduce_moduleA.md](...) | tag1, tag2 |
-```
+If no top-level reduce files exist (empty knowledge base) the index step is skipped and a warning is added to the run's error list.
 
 ---
 
@@ -396,9 +406,13 @@ Tracks pipeline progress for resumability.
   "completed_files": ["sha256:xyz"],
   "failed_files": [],
   "total_input_tokens": 0,
-  "total_output_tokens": 0
+  "total_output_tokens": 0,
+  "max_binary_mb": 50,
+  "locale": "und"
 }
 ```
+
+`max_binary_mb` is reused on resume; an explicit `--max-binary-mb` CLI flag overrides it and is written back. `locale` is set during Step 2/3 boundary by `_resolve_locale()` (see § "Locale Handling").
 
 ### .ingest/journal.jsonl
 
@@ -427,17 +441,18 @@ Existing output files are considered valid and are not reprocessed unless explic
 - Files with `status: "pending"` or `status: "failed"` are (re)processed.
 - Completed steps (recorded in `state.json.completed_steps`) are skipped.
 
-When `state.json` exists and `current_step < 4`, the user is prompted:
+When `state.json` exists and `current_step < 4`, the user sees a yes/no Click confirm prompt (default = yes):
 
 ```
-Existing ingest state detected (step {N}/4). Resume? [y/N/amend]
+Found existing run at step {N}. Resume? [Y/n]:
 ```
 
-- `y` → resume from pending files
-- `N` → abort
-- `amend` → equivalent to `/ingest-amend <source>`
+- yes → resume from pending files and incomplete steps
+- no → start a fresh run (the existing state is discarded in memory; manifest/state are overwritten as Step 0 runs)
 
-If `--rpm` is explicitly passed on resume, it overrides the value stored in `state.json` and the new value is written back. If omitted, the stored value is used.
+There is no third "amend" branch on this prompt — re-amending is done by invoking the separate `ingest-amend` command.
+
+If `--rpm` is explicitly passed on resume, it overrides the value stored in `state.json` and the new value is written back. If omitted, the stored value is used. Same rule applies to `--max-binary-mb`.
 
 ---
 
@@ -453,6 +468,8 @@ Full pipeline execution from scratch.
 |------|---------|-------------|
 | `--rpm INT` | `60` | Maximum API requests per minute. Sleep interval = `60 / rpm` seconds between calls. |
 | `--max-binary-mb INT` | `50` | Binary files (`binary-doc`, `binary-image`) larger than this threshold are skipped. Set to `0` to disable the limit. |
+| `--locale LOCALE` | (auto) | Force the synthesis locale (e.g. `en`, `fr`, `fr_CA`). Skips auto-detection and interactive prompt. |
+| `--prompts-dir PATH` | bundled `prompts/` | Directory containing the five prompt `.txt` files. |
 
 ```
 0. Abort with a clear error message if ANTHROPIC_API_KEY is not set.
@@ -468,13 +485,13 @@ Full pipeline execution from scratch.
 10. Print summary: files processed, tokens used, elapsed time, errors, skipped-oversized files.
 ```
 
-### `uv run ingest-add <source>`
+### `uv run ingest-add <source-subdir> <destination>`
 
 Adds a new subdirectory from the original source tree to an existing context.
 
-`<source>` is an absolute path rooted at the current working directory. It must be a subdirectory of the `source_root` recorded in `manifest.json`. The destination path is derived automatically by replacing the `source_root` prefix with `destination_root`.
+`<source-subdir>` must be a subdirectory of the `source_root` recorded in `<destination>/.ingest/manifest.json`. The relative path under `source_root` is computed and mirrored under `<destination>` to obtain the destination subdirectory.
 
-**Flags:** same `--rpm` and `--max-binary-mb` flags as `ingest`.
+**Flags:** same `--rpm`, `--max-binary-mb`, `--locale`, and `--prompts-dir` flags as `ingest`.
 
 ```
 Pre-conditions:
@@ -498,11 +515,11 @@ Journal event:
 {"ts": "ISO8601", "cmd": "ingest-add", "event": "source_added", "new_source": "./source/moduleC", "derived_dest": "./context/moduleC", "files_added": 7}
 ```
 
-### `uv run ingest-amend <source>`
+### `uv run ingest-amend <source-subdir> <destination>`
 
-Full reset and reprocessing of a source directory.
+Full reset and reprocessing of a source directory. SHA-256 hashes are checked first: files whose content hash still matches the manifest record are recorded as `file_unchanged` journal events and skipped; only changed (or missing) files are reprocessed.
 
-**Flags:** same `--rpm` and `--max-binary-mb` flags as `ingest`.
+**Flags:** same `--rpm`, `--max-binary-mb`, `--locale`, and `--prompts-dir` flags as `ingest`.
 
 ```
 Pre-conditions:
@@ -524,6 +541,39 @@ Journal event:
 ```json
 {"ts": "ISO8601", "cmd": "ingest-amend", "event": "amend_start", "scope": "/source/moduleA", "files_reset": 12}
 ```
+
+---
+
+## Locale Handling
+
+Every output file written by Steps 1–3 carries a `locale:` field in its YAML front matter. The pipeline both detects per-file locales and resolves a single synthesis locale for the run.
+
+### Detection — Step 1
+
+`extract.detect_locale(text)` scores the extracted text against built-in French and English stopword sets, returning `"fr"`, `"en"`, or `"und"` (undetermined). The result is stamped into the extract file's front matter. Detection is currently fr/en only; other languages always resolve to `"und"` until additional stopword sets are added.
+
+### Propagation — Step 2
+
+`summarize.summarize_file` reads the `locale:` field from the extract file's front matter (via `_extract_locale`) and copies it verbatim into the corresponding `_summary_*.md`.
+
+### Resolution — between Steps 2 and 3
+
+After all summaries are written, `pipeline._resolve_locale()` decides the run's synthesis locale in this order:
+
+1. **`--locale LOCALE` CLI flag** — if provided, it is used directly. No scan, no prompt.
+2. **Single detected locale** — if all `_summary_*.md` files agree on one non-`und` locale, it is used automatically.
+3. **Multiple detected locales** — `ui.confirm_locale()` prompts the user with the per-locale file counts and the dominant locale as default; an `auto` choice resolves to `"und"`.
+4. **No locale detected** — defaults to `"und"`.
+
+The chosen value is stored in `state.locale` and saved to `state.json`.
+
+### Application — Step 3
+
+`reduce._dominant_locale()` computes a per-directory locale from the inputs' `locale:` fields (most-frequent non-`und`; falls back to `"und"`). That value is written into the reduce file's front matter and also passed to the model as `Language: {locale}` in the user content block, instructing the model to synthesize in that language without translating source content.
+
+### Application — Step 4
+
+The index step does not currently consume `state.locale` directly; `prompts/index.txt` instructs the model to detect the dominant language from the reduce inputs and write the index in that language. The `--locale` flag therefore primarily affects Step 3 outputs.
 
 ---
 

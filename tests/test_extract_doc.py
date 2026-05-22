@@ -164,8 +164,8 @@ def test_cli_pptx_image_only_warning_in_output(mock_extract: MagicMock, tmp_path
     result = runner.invoke(main, [str(src)])
 
     assert result.exit_code == 0
-    # Warning line and JSON output both appear in combined output
-    assert "slide 2" in result.output
+    # Warning line (JSON) and main JSON output both appear in combined output
+    assert '"slide": 2' in result.output
     assert "image-only" in result.output
     # Last line must be valid JSON with the extracted text
     json_line = [line for line in result.output.splitlines() if line.startswith("{")][-1]

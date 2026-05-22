@@ -1,5 +1,7 @@
+import hashlib
 import os
 import time
+from collections import Counter
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,13 +17,41 @@ from .state import (
 from .walker import build_manifest_files, find_symlinks, mirror_dirs
 from .extract import extract_file, run_extract_step
 from .summarize import run_summarize_step
-from .reduce import run_reduce_step, run_reduce_from_dir
+from .reduce import run_reduce_step, run_reduce_from_dir, _extract_locale
 from .index import run_index_step
-from .ui import pipeline_progress, print_warning, print_summary, confirm_resume
+from .ui import pipeline_progress, print_warning, print_summary, confirm_resume, confirm_locale
 
 
 class PipelineError(Exception):
     """Raised when the pipeline cannot proceed due to a configuration or precondition failure."""
+
+
+def _file_hash(path: Path) -> str:
+    return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+
+
+def _collect_locale_distribution(dest_root: Path) -> dict[str, int]:
+    counts: Counter = Counter()
+    for summary_path in dest_root.rglob("_summary_*.md"):
+        locale = _extract_locale(summary_path.read_text(encoding="utf-8"))
+        if locale != "und":
+            counts[locale] += 1
+    return dict(counts)
+
+
+def _resolve_locale(dest_root: Path, state: State, forced_locale: str | None = None) -> str:
+    if forced_locale is not None:
+        state.locale = forced_locale
+        return forced_locale
+    locales = _collect_locale_distribution(dest_root)
+    if not locales:
+        return "und"
+    if len(locales) == 1:
+        state.locale = next(iter(locales))
+        return state.locale
+    chosen = confirm_locale(locales)
+    state.locale = chosen
+    return chosen
 
 
 def _make_state(source: Path, dest: Path, rpm: int, max_binary_mb: int = 50, cmd: str = "ingest") -> State:
@@ -185,6 +215,7 @@ def run_ingest(
     rpm: int,
     prompts_dir: Path | None = None,
     max_binary_mb: int | None = None,
+    locale: str | None = None,
     cmd: str = "ingest",
 ) -> None:
     start_time = time.monotonic()
@@ -211,6 +242,10 @@ def run_ingest(
         manifest, records = _step_walk_source(source, dest, state, on_progress, print_warning, cmd)
         all_errors.extend(_step_extract(records, manifest, prompts, client, state, dest, on_progress))
         all_errors.extend(_step_summarize(records, prompts, client, state, dest, on_progress))
+
+    _resolve_locale(dest, state, forced_locale=locale)
+
+    with pipeline_progress() as on_progress:
         all_errors.extend(_step_reduce(dest, prompts, client, state, on_progress))
         all_errors.extend(_step_index(dest, prompts, client, state, on_progress))
 
@@ -225,6 +260,7 @@ def run_ingest_add(
     rpm: int,
     prompts_dir: Path | None = None,
     max_binary_mb: int | None = None,
+    locale: str | None = None,
 ) -> None:
     start_time = time.monotonic()
     prompts, client = _init_pipeline(prompts_dir)
@@ -300,6 +336,9 @@ def run_ingest_add(
         summarize_errors = run_summarize_step(extracted_records, prompts, client, rpm, state, dest)
         all_errors.extend(summarize_errors)
 
+    _resolve_locale(dest, state, forced_locale=locale)
+
+    with pipeline_progress() as on_progress:
         on_progress("Step 3: Reducing...")
 
         def on_reduce_add(path: str) -> None:
@@ -334,6 +373,7 @@ def run_ingest_amend(
     rpm: int,
     prompts_dir: Path | None = None,
     max_binary_mb: int | None = None,
+    locale: str | None = None,
 ) -> None:
     start_time = time.monotonic()
     prompts, client = _init_pipeline(prompts_dir)
@@ -354,15 +394,29 @@ def run_ingest_amend(
             f"No manifest records found for {source}. Nothing to amend."
         )
 
+    # Partition affected records into changed vs unchanged by content hash
+    changed: list[ManifestFile] = []
+    unchanged: list[ManifestFile] = []
     for record in affected:
+        src_path = Path(record.source_path)
+        if src_path.exists() and _file_hash(src_path) == record.id:
+            unchanged.append(record)
+        else:
+            changed.append(record)
+
+    # Delete generated output only for changed files
+    for record in changed:
         dest_path = Path(record.destination_path)
         if dest_path.exists():
             dest_path.unlink()
         summary_path = dest_path.parent / f"_summary_{dest_path.stem}.md"
         if summary_path.exists():
             summary_path.unlink()
+        record.status = "pending"
 
-    dest_subdirs: set[Path] = {Path(r.destination_path).parent for r in affected}
+    dest_subdirs: set[Path] = {Path(r.destination_path).parent for r in changed} or {
+        Path(r.destination_path).parent for r in affected
+    }
 
     for dest_subdir in dest_subdirs:
         current = dest_subdir
@@ -376,9 +430,6 @@ def run_ingest_amend(
     index_path = dest / "index.md"
     if index_path.exists():
         index_path.unlink()
-
-    for record in affected:
-        record.status = "pending"
 
     save_manifest(dest, manifest)
 
@@ -400,24 +451,32 @@ def run_ingest_amend(
         journal_event(
             "amend_start",
             scope=str(source),
-            files_reset=len(affected),
+            files_reset=len(changed),
+            files_unchanged=len(unchanged),
             cmd="ingest-amend",
         ),
     )
+    for record in unchanged:
+        append_journal(dest, journal_event(
+            "file_unchanged", step=1, source=record.source_path, reason="content_hash_match", cmd="ingest-amend",
+        ))
 
     all_errors: list[str] = []
 
     with pipeline_progress() as on_progress:
         on_progress("Step 1: Extracting...")
-        extract_errors = run_extract_step(affected, prompts, client, rpm, state, dest)
+        extract_errors = run_extract_step(changed, prompts, client, rpm, state, dest)
         all_errors.extend(extract_errors)
         save_manifest(dest, manifest)
 
         on_progress("Step 2: Summarizing...")
-        extracted_records = [r for r in affected if r.status in ("extracted", "pending")]
+        extracted_records = [r for r in changed if r.status in ("extracted", "pending")]
         summarize_errors = run_summarize_step(extracted_records, prompts, client, rpm, state, dest)
         all_errors.extend(summarize_errors)
 
+    _resolve_locale(dest, state, forced_locale=locale)
+
+    with pipeline_progress() as on_progress:
         on_progress("Step 3: Reducing...")
 
         def on_reduce_amend(path: str) -> None:

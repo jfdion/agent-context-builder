@@ -47,6 +47,6 @@ def load_prompts(prompts_dir: Path) -> dict[str, str]:
     names = ["extract_text", "extract_image", "summarize", "reduce", "index"]
     prompts: dict[str, str] = {}
     for name in names:
-        path = prompts_dir / f"{name}.txt"
+        path = prompts_dir / (name + ".txt")
         prompts[name] = path.read_text(encoding="utf-8")
     return prompts

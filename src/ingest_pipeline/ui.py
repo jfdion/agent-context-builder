@@ -23,6 +23,20 @@ def confirm_resume(step: int) -> bool:
     )
 
 
+def confirm_locale(locales: dict[str, int]) -> str:
+    """Prompt user to choose synthesis language when multiple locales are detected."""
+    distribution = ", ".join(f"{lang} ({count})" for lang, count in sorted(locales.items()))
+    console.print(f"[yellow]Multiple locales detected: {distribution}[/yellow]")
+    choices = sorted(locales.keys()) + ["auto"]
+    dominant = max(locales, key=lambda k: locales[k])
+    choice = click.prompt(
+        "Select synthesis language",
+        type=click.Choice(choices),
+        default=dominant,
+    )
+    return choice if choice != "auto" else "und"
+
+
 @contextmanager
 def pipeline_progress() -> Iterator[Callable[[str], None]]:
     with Progress(

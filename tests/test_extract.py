@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ingest_pipeline.extract import has_complexity_signals, extract_text_file, extract_file
+from ingest_pipeline.extract import has_complexity_signals, extract_text_file, extract_file, detect_locale
 from ingest_pipeline.state import ManifestFile, State, ingest_dir
 from datetime import datetime, timezone
 
@@ -150,3 +150,71 @@ def test_extract_file_binary_doc_calls_extractor(tmp_path: Path, mock_client: Ma
     content = dest_file.read_text(encoding="utf-8")
     assert "source:" in content
     assert "Extracted PDF" in content
+
+
+# ---------------------------------------------------------------------------
+# detect_locale tests
+# ---------------------------------------------------------------------------
+
+def test_detect_locale_french() -> None:
+    text = "Les étudiants et les professeurs participent dans les cours et les exercices avec les outils."
+    assert detect_locale(text) == "fr"
+
+
+def test_detect_locale_english() -> None:
+    text = "The students and the teachers participate in the courses and the exercises with the tools."
+    assert detect_locale(text) == "en"
+
+
+def test_detect_locale_undetermined() -> None:
+    text = "xyz123 abc def"
+    assert detect_locale(text) == "und"
+
+
+# ---------------------------------------------------------------------------
+# Locale in extracted file front matter
+# ---------------------------------------------------------------------------
+
+def test_extract_text_file_includes_locale(tmp_path: Path) -> None:
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    ingest_dir(dest).mkdir()
+    src = tmp_path / "doc.txt"
+    src.write_text(
+        "Les étudiants participent dans les cours et les exercices avec les outils et les professeurs.",
+        encoding="utf-8",
+    )
+    dest_file = dest / "doc.md"
+    record = _make_record(str(src), str(dest_file))
+    state = _make_state(dest)
+    prompts = {k: "p" for k in ["extract_text", "extract_image", "summarize", "reduce", "index"]}
+
+    with patch("ingest_pipeline.extract.call_claude", return_value="content"):
+        extract_text_file(src, dest_file, record, prompts, MagicMock(), 60, state, dest)
+
+    content = dest_file.read_text(encoding="utf-8")
+    assert "locale:" in content
+
+
+# ---------------------------------------------------------------------------
+# Relative paths in front matter
+# ---------------------------------------------------------------------------
+
+def test_extract_text_file_uses_relative_source_path(tmp_path: Path) -> None:
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    ingest_dir(dest).mkdir()
+    src = tmp_path / "src" / "doc.txt"
+    src.parent.mkdir()
+    src.write_text("simple text content", encoding="utf-8")
+    dest_file = dest / "doc.md"
+    record = _make_record(str(src), str(dest_file))
+    state = _make_state(dest)
+    prompts = {k: "p" for k in ["extract_text", "extract_image", "summarize", "reduce", "index"]}
+
+    extract_text_file(src, dest_file, record, prompts, MagicMock(), 60, state, dest)
+
+    content = dest_file.read_text(encoding="utf-8")
+    # source path in front matter should not be an absolute path starting with /home or /tmp
+    # (relative to CWD if possible)
+    assert "source:" in content
